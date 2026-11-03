@@ -1,0 +1,6 @@
+ReqSucc
+Copyright 2026 Andersen
+
+This project includes a modified copy of gpui-pre-macos 0.3.11 from
+Zed Industries and contributors, licensed under the Apache License 2.0.
+See vendor/gpui-pre-macos/LICENSE-APACHE and PATCHES.md in that directory.
