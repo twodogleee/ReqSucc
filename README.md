@@ -152,6 +152,8 @@ python scripts/release.py package --platform windows-x64 --binary-dir target/x86
 
 如果 Perl 安装路径不同，请调整 `OPENSSL_SRC_PERL`。打包依赖开发者命令行提供的 `VCToolsRedistDir`，用于收集 MSVC x64 运行库；缺失时脚本会停止，避免生成不能独立运行的包。
 
+Windows 编译请使用上述开发者命令行或已加载 MSVC 环境的 PowerShell。若日志中的链接器为 `Git\usr\bin\link.exe`，说明误用了 Git Bash 的同名工具；应切换终端并检查 `where.exe link.exe` 的首项来自 Visual Studio。CI 使用 PowerShell 构建，显式固定 MSVC 链接器，并在依赖编译前验证宿主程序能完成链接和启动。
+
 输出为 `target/dist/ReqSucc-v0.4.0-windows-x64.zip`，包含 `ReqSucc.exe`、运行库、README 和许可文件。正式程序内嵌图标、版本与多显示器 DPI 清单，不显示控制台；启动失败和重复启动使用中文原生消息框。
 
 ## GitHub 构建与分发

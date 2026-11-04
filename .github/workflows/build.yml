@@ -31,12 +31,14 @@ jobs:
           - platform: windows-x64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
+            shell: pwsh
           - platform: macos-arm64
             runner: macos-15
             target: aarch64-apple-darwin
+            shell: bash
     defaults:
       run:
-        shell: bash
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,8 +61,31 @@ jobs:
           'C:\Strawberry\perl\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           if (!(Test-Path 'C:\Strawberry\perl\bin\perl.exe')) { throw '未找到 Windows 原生 Perl' }
           'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Git Bash 的同名 link.exe 不是 MSVC 链接器；同时固定 Cargo 配置和子进程搜索路径。
+          if (!$env:VCToolsInstallDir) { throw 'MSVC 环境未初始化' }
+          $msvcBin = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64'
+          $msvcLink = Join-Path $msvcBin 'link.exe'
+          if (!(Test-Path $msvcLink)) { throw '未找到 MSVC x64 链接器' }
+          $msvcBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$msvcLink" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: 安装锁定工具链
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --target '${{ matrix.target }}'
+        run: rustup toolchain install '${{ env.RUSTUP_TOOLCHAIN }}' --profile minimal --component rustfmt --target '${{ matrix.target }}'
+      - name: 验证 Windows 链接工具链
+        if: runner.os == 'Windows'
+        run: |
+          $resolvedLink = (Get-Command link.exe -CommandType Application).Source
+          if ($resolvedLink -ne $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER) {
+            throw "链接器路径错误：$resolvedLink"
+          }
+          Write-Host "MSVC linker: $resolvedLink"
+          # 显式目标构建仍会编译宿主构建脚本，先验证默认宿主链接也可用。
+          $probeSource = Join-Path $env:RUNNER_TEMP 'reqsucc_link_check.rs'
+          $probeBinary = Join-Path $env:RUNNER_TEMP 'reqsucc_link_check.exe'
+          'fn main() {}' | Set-Content -Path $probeSource -Encoding utf8
+          rustc --crate-name reqsucc_link_check $probeSource -o $probeBinary
+          if ($LASTEXITCODE -ne 0) { throw 'Rust 宿主链接检查失败' }
+          & $probeBinary
+          if ($LASTEXITCODE -ne 0) { throw 'Rust 宿主程序启动失败' }
       - name: 缓存依赖下载
         uses: actions/cache@v4
         with:
@@ -71,6 +96,8 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
       - name: 校验版本和脚本
+        # 此步骤只校验元数据、Python 和格式；保留 Bash 的逐条失败退出语义。
+        shell: bash
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: |
