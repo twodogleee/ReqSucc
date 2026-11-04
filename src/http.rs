@@ -1,3 +1,7 @@
+//! HTTP 请求执行器，负责变量与认证解析、取消和超时、敏感信息遮蔽及临时响应缓存。
+//!
+//! 作者：Andersen
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{
     Method, Url,
@@ -13,36 +17,54 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// 请求展示文本和响应预览的容量上限，单位为字节，当前为 2 MiB。
 const PREVIEW: usize = 2 * 1024 * 1024;
+/// 参数、请求头、表单或变量列表中的一行配置，保留启用及敏感标记。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Row {
+    /// 行的稳定标识，用于编辑器定位；缺失时按空字符串反序列化。
     #[serde(default)]
     pub id: String,
+    /// 是否参与当前请求或变量解析；旧数据缺失此字段时默认启用。
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// 参数名、请求头名或变量名，具体约束由所在配置决定。
     pub key: String,
+    /// 原始配置值，可包含待发送时解析的变量占位符。
     pub value: String,
+    /// 供用户维护的说明文字，不作为网络参数发送。
     #[serde(default)]
     pub description: String,
+    /// 是否将变量值作为敏感内容遮蔽；不表示本地存储已加密。
     #[serde(default)]
     pub secret: bool,
 }
+/// 为旧版配置缺失的 enabled 字段提供启用默认值。
 fn yes() -> bool {
     true
 }
+/// 请求认证配置，执行前由模型层完成集合认证继承。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Auth {
+    /// 认证方式：none、bearer、basic 或 apiKey。
     pub kind: String,
+    /// Bearer 令牌模板，发送时解析并加入敏感值列表。
     pub token: String,
+    /// Basic 认证用户名模板，解析后不得包含冒号。
     pub username: String,
+    /// Basic 认证密码模板，解析后的值用于展示遮蔽。
     pub password: String,
+    /// API Key 写入的请求头或查询参数名称。
     pub api_key_name: String,
+    /// API Key 值模板，发送时解析并遮蔽展示。
     pub api_key_value: String,
+    /// API Key 传递位置，支持 header 和 query。
     pub api_key_in: String,
 }
 impl Default for Auth {
+    /// 创建无认证配置；API Key 的默认位置为请求头。
     fn default() -> Self {
         Self {
             kind: "none".into(),
@@ -55,16 +77,23 @@ impl Default for Auth {
         }
     }
 }
+/// 单次 HTTP 请求的超时、重定向、TLS 和响应接收限制。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Options {
+    /// 从执行到响应接收的总超时，单位毫秒，允许 1–3600000，默认 30000。
     pub timeout_ms: u64,
+    /// 建立连接的超时，单位毫秒，允许 1–3600000，默认 10000。
     pub connect_timeout_ms: u64,
+    /// 是否按执行器的安全规则跟随重定向，默认启用。
     pub follow_redirects: bool,
+    /// 是否校验 TLS 证书，默认启用；关闭仅作用于本次请求。
     pub verify_tls: bool,
+    /// 响应缓存的接收上限，单位 MiB，允许 1–1024，默认 100。
     pub max_response_mib: u64,
 }
 impl Default for Options {
+    /// 提供 30 秒总超时、10 秒连接超时、TLS 校验及 100 MiB 接收上限。
     fn default() -> Self {
         Self {
             timeout_ms: 30000,
@@ -75,33 +104,53 @@ impl Default for Options {
         }
     }
 }
+/// 发送时冻结的请求与变量配置快照，避免执行过程中受界面编辑影响。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Input {
+    /// 参数表是否已经反映 URL 查询串；为 true 时以参数表重建查询，避免重复发送。
     #[serde(default)]
     pub query_synced: bool,
+    /// 待校验的 HTTP 方法名称。
     pub method: String,
+    /// 原始 HTTP 或 HTTPS 地址，可包含变量占位符。
     pub url: String,
+    /// 有序查询参数行，允许重复键并保留空值。
     pub params: Vec<Row>,
+    /// 用户配置的请求头行，发送时过滤禁用项并校验托管头冲突。
     pub headers: Vec<Row>,
+    /// JSON、文本或 XML 请求体的原始模板。
     pub body: String,
+    /// 请求体类型：none、json、text、xml 或 form。
     pub body_type: String,
+    /// 表单编码请求体的键值行，仅 form 类型使用。
     #[serde(default)]
     pub form: Vec<Row>,
+    /// 已完成集合继承、尚未展开变量的认证配置。
     pub auth: Auth,
+    /// 全局默认设置与请求覆盖设置合并后的执行限制。
     pub options: Options,
+    /// 最低优先级的全局变量配置。
     pub globals: Vec<Row>,
+    /// 所属集合变量，覆盖同名全局变量。
     pub collection_variables: Vec<Row>,
+    /// 当前环境变量，覆盖集合和全局的同名变量。
     pub environment_variables: Vec<Row>,
+    /// 执行时环境名称，仅用于实际请求信息展示。
     pub environment_name: String,
 }
+/// 本地校验、网络或缓存失败；HTTP 非成功状态码仍作为正常响应返回。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Failure {
+    /// 失败分类，供界面区分校验、取消、超时和网络等原因。
     pub kind: String,
+    /// 面向用户的中文错误说明，不包含原始认证凭据。
     pub message: String,
+    /// 失败前已耗时的毫秒数；发送前校验失败时为 0。
     pub elapsed_ms: u64,
 }
+/// 构建尚未计时的分类错误，执行结束时再补充实际耗时。
 fn fail(kind: &str, message: impl Into<String>) -> Failure {
     Failure {
         kind: kind.into(),
@@ -109,58 +158,99 @@ fn fail(kind: &str, message: impl Into<String>) -> Failure {
         elapsed_ms: 0,
     }
 }
+/// 响应头、Cookie 或展示用请求头的名称与值，不折叠重复项。
 #[derive(Clone, Debug, Serialize)]
 pub struct Pair {
+    /// 头字段名称；Cookie 列表中保持 Set-Cookie 头名称。
     pub name: String,
+    /// 对应头字段值，是否遮蔽由生成或展示该列表的路径决定。
     pub value: String,
 }
+/// 解析和认证组装后的请求展示快照，敏感内容经过遮蔽。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Effective {
+    /// 实际准备发送的 HTTP 方法。
     pub method: String,
+    /// 完成查询参数组装且经过敏感值遮蔽的地址。
     pub url: String,
+    /// 加入认证和默认头后用于展示的脱敏请求头列表。
     pub headers: Vec<Pair>,
+    /// 经脱敏及容量限制处理的请求体展示文本。
     pub body: String,
+    /// 本次执行所选环境的显示名称。
     pub environment: String,
 }
+/// HTTP 响应元数据与有限正文预览，完整已接收字节另存临时文件。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Output {
+    /// 执行标识，用于关联响应临时文件与标签运行状态。
     pub run_id: String,
+    /// 服务器返回的 HTTP 数值状态码。
     pub status: u16,
+    /// 状态码对应的中文说明。
     pub status_text: String,
+    /// 执行至响应缓存写入完成的耗时，单位毫秒。
     pub elapsed_ms: u64,
+    /// 实际缓存的响应正文大小，单位字节，受接收上限约束。
     pub received_bytes: usize,
+    /// 重定向结束后的脱敏地址。
     pub final_url: String,
+    /// 本次执行实际跟随的重定向次数。
     pub redirects: usize,
+    /// 服务器响应头列表，保留重复头及原始值。
     pub headers: Vec<Pair>,
+    /// 从响应头提取的 Set-Cookie 项，展示时另行遮蔽。
     pub cookies: Vec<Pair>,
+    /// 解码后的有限文本预览；二进制响应为空字符串。
     pub body: String,
+    /// 是否应作为二进制处理，界面据此禁止文本预览。
     pub binary: bool,
+    /// 正文解码采用的字符编码名称。
     pub encoding: String,
+    /// 接收字节数是否超过预览容量，不等同于响应接收被截断。
     pub preview_limited: bool,
+    /// 是否因达到接收上限而截断正文；为 true 时缓存也不完整。
     pub incomplete: bool,
+    /// 本次请求的脱敏展示快照。
     pub effective: Effective,
 }
+/// 发送前已校验并展开变量的请求，包含真实网络数据与独立展示快照。
 struct Prepared {
+    /// 已校验的 HTTP 方法。
     method: Method,
+    /// 包含最终查询参数的真实请求地址，可能含敏感值。
     url: Url,
+    /// 准备发送的请求头，包含认证信息，不可直接输出日志。
     headers: HeaderMap,
+    /// 编码后的请求体字节；None 表示无请求体。
     body: Option<Vec<u8>>,
+    /// 本次执行使用的网络与容量限制。
     options: Options,
+    /// 与真实网络数据分离的脱敏展示内容。
     effective: Effective,
+    /// 需要遮蔽的非空敏感值，按长度降序排列以避免部分替换泄露。
     secrets: Vec<String>,
+    /// 是否使用认证或敏感请求头，用于阻止携带私有数据的跨源重定向。
     has_sensitive: bool,
 }
+/// 单次已登记请求的取消信号及尚未取走的执行配置。
 struct Run {
+    /// 通知执行任务提前停止的取消信号。
     token: CancellationToken,
+    /// 仅能消费一次的请求配置，取走后禁止重复执行同一运行标识。
     prepared: Option<Prepared>,
 }
+/// 管理最多五个在途 HTTP 请求及最多五十份响应临时缓存。
 #[derive(Default)]
 pub struct HttpService {
+    /// 运行标识到待执行或执行中请求的映射，受互斥锁保护。
     runs: Mutex<HashMap<String, Run>>,
+    /// 运行标识到响应临时文件的共享引用，导出期间可延长文件生命周期。
     files: Mutex<HashMap<String, Arc<tempfile::NamedTempFile>>>,
 }
+/// 根据名称识别令牌、密码及认证或 Cookie 等敏感字段。
 fn sensitive(key: &str) -> bool {
     let s = key.to_lowercase();
     s.contains("token")
@@ -173,6 +263,7 @@ fn sensitive(key: &str) -> bool {
         || s == "cookie"
         || s == "set-cookie"
 }
+/// 遮蔽文本中的敏感原值及表单编码值，空敏感值不参与替换。
 fn mask(value: &str, secrets: &[String]) -> String {
     let mut s = value.to_owned();
     for secret in secrets {
@@ -184,6 +275,7 @@ fn mask(value: &str, secrets: &[String]) -> String {
     }
     s
 }
+/// 遮蔽 URL 中的敏感查询项与已知敏感值，生成展示用地址。
 fn safe_url(url: &Url, secrets: &[String]) -> String {
     let mut u = url.clone();
     if url.query().is_some() {
@@ -203,7 +295,8 @@ fn safe_url(url: &Url, secrets: &[String]) -> String {
     }
     mask(u.as_str(), secrets)
 }
-fn variables(input: &Input) -> Result<(HashMap<String, String>, Vec<String>), Failure> {
+/// 按全局、集合、环境顺序合并启用变量并收集敏感值；同作用域重名返回错误。
+pub(crate) fn variables(input: &Input) -> Result<(HashMap<String, String>, Vec<String>), Failure> {
     let mut map = HashMap::new();
     let mut secrets = Vec::new();
     for scope in [
@@ -228,7 +321,8 @@ fn variables(input: &Input) -> Result<(HashMap<String, String>, Vec<String>), Fa
     }
     Ok((map, secrets))
 }
-fn expand(
+/// 单层展开变量占位符，将未定义项及字段标签写入 missing；不递归展开替换结果。
+pub(crate) fn expand(
     value: &str,
     label: &str,
     map: &HashMap<String, String>,
@@ -256,7 +350,9 @@ fn expand(
     result.push_str(rest);
     result
 }
+/// 按请求体类型遮蔽敏感内容并生成有限预览，截断时保持 UTF-8 字符边界。
 fn preview_body(body: &Option<Vec<u8>>, kind: &str, secrets: &[String]) -> String {
+    /// 递归遮蔽 JSON 对象中名称敏感的字段，数组元素继续递归处理。
     fn redact(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(map) => {
@@ -312,6 +408,7 @@ fn preview_body(body: &Option<Vec<u8>>, kind: &str, secrets: &[String]) -> Strin
     }
     preview
 }
+/// 校验请求限制、地址、认证与头冲突，展开变量并组装真实请求及脱敏预览；不发起网络通信。
 fn prepare(input: Input) -> Result<Prepared, Failure> {
     let o = &input.options;
     if !(1..=3600000).contains(&o.timeout_ms)
@@ -559,6 +656,7 @@ fn prepare(input: Input) -> Result<Prepared, Failure> {
     })
 }
 impl HttpService {
+    /// 校验并登记请求，返回运行标识；配置错误或并发数达到五个时拒绝登记。
     pub fn start(&self, input: Input) -> Result<String, Failure> {
         let prepared = prepare(input)?;
         let mut runs = self
@@ -578,17 +676,20 @@ impl HttpService {
         );
         Ok(id)
     }
+    /// 触发指定运行标识的取消信号；标识已不存在时视为无需取消。
     pub fn cancel(&self, id: &str) -> Result<(), String> {
         if let Some(run) = self.runs.lock().map_err(|_| "请求服务不可用")?.get(id) {
             run.token.cancel();
         }
         Ok(())
     }
+    /// 移除指定响应缓存的服务引用；已持有的导出引用仍可继续读取。
     pub fn release(&self, id: &str) {
         if let Ok(mut files) = self.files.lock() {
             files.remove(id);
         }
     }
+    /// 取消全部在途请求并释放服务持有的响应缓存，用于关闭或切换工作空间。
     pub fn clear(&self) {
         if let Ok(runs) = self.runs.lock() {
             for run in runs.values() {
@@ -599,6 +700,7 @@ impl HttpService {
             files.clear();
         }
     }
+    /// 获取响应临时文件的共享引用；缓存已释放或锁不可用时返回错误。
     pub fn file(&self, id: &str) -> Result<Arc<tempfile::NamedTempFile>, String> {
         self.files
             .lock()
@@ -607,6 +709,7 @@ impl HttpService {
             .cloned()
             .ok_or("响应文件已释放，请重新发送请求".into())
     }
+    /// 消费已登记请求并执行，优先响应取消信号；结束后释放并发名额，失败时补充耗时。
     pub async fn execute(&self, id: String) -> Result<Output, Failure> {
         let (p, token) = {
             let mut runs = self
@@ -634,6 +737,7 @@ impl HttpService {
             e
         })
     }
+    /// 执行受控重定向并流式缓存响应；接收超限返回不完整标记，网络或缓存失败返回错误。
     async fn perform(&self, id: &str, p: Prepared) -> Result<Output, Failure> {
         let started = Instant::now();
         let mut url = p.url.clone();
@@ -822,6 +926,7 @@ impl HttpService {
         Ok(output)
     }
 }
+/// 将网络库错误归类为中文诊断信息，避免直接向界面暴露含地址或凭据的原始错误。
 fn network_error(e: reqwest::Error) -> Failure {
     let detail = format!("{e:?}").to_lowercase();
     if e.is_timeout() {
@@ -839,6 +944,7 @@ fn network_error(e: reqwest::Error) -> Failure {
         )
     }
 }
+/// 将常见 HTTP 状态码转换为中文说明，其余按状态码区间提供说明。
 fn status_label(code: u16) -> &'static str {
     match code {
         200 => "成功",
@@ -868,6 +974,7 @@ fn status_label(code: u16) -> &'static str {
     }
 }
 
+/// 使用本机 HTTP 服务验证请求语义、失败边界与响应缓存。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +982,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    /// 构造一条启用且非敏感的测试键值行。
     fn row(key: &str, value: &str) -> Row {
         Row {
             id: Uuid::new_v4().to_string(),
@@ -885,6 +993,7 @@ mod tests {
             secret: false,
         }
     }
+    /// 为指定地址构造默认 GET 请求，供各测试仅覆盖关注的配置。
     fn input(url: String) -> Input {
         Input {
             query_synced: false,
@@ -903,6 +1012,7 @@ mod tests {
             environment_name: "本地".into(),
         }
     }
+    /// 启动本机模拟 HTTP 服务并记录收到的请求，返回访问地址与请求记录通道。
     async fn server(
         body: Vec<u8>,
         status: &str,
@@ -950,6 +1060,7 @@ mod tests {
         });
         (url, rx)
     }
+    /// 验证变量作用域覆盖、空值、禁用项以及单层展开语义。
     #[test]
     fn variables_precedence_empty_disabled_and_single_level() {
         let mut i = input("http://localhost/{{path}}".into());
@@ -973,6 +1084,7 @@ mod tests {
             ]
         );
     }
+    /// 验证未定义变量与手写认证头冲突在发送前被拒绝。
     #[test]
     fn missing_variables_and_auth_conflict_block_before_network() {
         let mut i = input("http://localhost/{{missing}}".into());
@@ -983,6 +1095,7 @@ mod tests {
         i.headers.push(row("authorization", "manual"));
         assert!(prepare(i).err().unwrap().message.contains("冲突"));
     }
+    /// 验证解析后的认证、重复查询参数和 JSON 请求体，并保留 500 状态响应。
     #[tokio::test]
     async fn sends_resolved_auth_repeated_query_and_json_and_keeps_500_response() {
         let(url,rx)=server(b"{\"error\":\"bad\"}".to_vec(),"500 Internal Server Error","Content-Type: application/json\r\nX-Repeat: first\r\nX-Repeat: second\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n",0).await;
@@ -1017,6 +1130,7 @@ mod tests {
         s.release(&id);
         assert!(s.file(&id).is_err());
     }
+    /// 验证 Basic 认证、表单编码及已同步查询参数只发送一次。
     #[tokio::test]
     async fn basic_auth_form_encoding_and_synced_query_sent_once() {
         let (url, rx) = server(b"ok".to_vec(), "200 OK", "Content-Type: text/plain\r\n", 0).await;
@@ -1040,6 +1154,7 @@ mod tests {
         assert!(wire.starts_with("POST /?a=one HTTP/1.1"));
         assert!(wire.ends_with("q=%E4%B8%AD%E6%96%87+%2B&q="));
     }
+    /// 验证请求头和查询参数两种 API Key 位置及展示遮蔽。
     #[test]
     fn api_keys_support_header_query_and_redaction() {
         let mut i = input("http://localhost".into());
@@ -1062,6 +1177,7 @@ mod tests {
         assert!(p.url.query().unwrap().contains("top-secret"));
         assert!(!p.effective.url.contains("top-secret"));
     }
+    /// 验证取消可中止响应等待并释放请求并发名额。
     #[tokio::test]
     async fn cancellation_stops_wait_and_releases_concurrency_slot() {
         let (url, rx) = server(b"slow".to_vec(), "200 OK", "", 1500).await;
@@ -1082,6 +1198,7 @@ mod tests {
         assert_eq!(r.kind, "cancelled");
         assert!(s.runs.lock().unwrap().is_empty());
     }
+    /// 验证执行前已取消的请求不会发起网络发送。
     #[tokio::test]
     async fn cancel_before_execute_never_sends() {
         let s = HttpService::default();
@@ -1089,6 +1206,7 @@ mod tests {
         s.cancel(&id).unwrap();
         assert_eq!(s.execute(id).await.unwrap_err().kind, "cancelled");
     }
+    /// 验证超时与连接失败返回对应的中文错误分类。
     #[tokio::test]
     async fn timeout_and_connection_failure_are_localized() {
         let (url, _) = server(vec![], "200 OK", "", 500).await;
@@ -1103,6 +1221,7 @@ mod tests {
         let id = s.start(input(url)).unwrap();
         assert_eq!(s.execute(id).await.unwrap_err().kind, "connect");
     }
+    /// 验证预览截断仍保留完整缓存，而接收超限会标记缓存不完整。
     #[tokio::test]
     async fn response_preview_limit_keeps_raw_file_and_receive_cap_marks_incomplete() {
         let (url, _) = server(
@@ -1136,6 +1255,7 @@ mod tests {
         assert!(r.incomplete);
         assert_eq!(r.received_bytes, 1024 * 1024);
     }
+    /// 验证二进制和非 UTF-8 响应的展示判断及原始字节缓存。
     #[tokio::test]
     async fn binary_and_non_utf8_are_handled_without_loss() {
         let (url, _) = server(
@@ -1164,6 +1284,7 @@ mod tests {
         let id = s.start(input(url)).unwrap();
         assert_eq!(s.execute(id).await.unwrap().body, "中文");
     }
+    /// 验证携带敏感内容的跨源重定向被阻止。
     #[tokio::test]
     async fn cross_origin_sensitive_redirect_is_blocked() {
         let (url, _) = server(
@@ -1183,6 +1304,7 @@ mod tests {
         let id = s.start(i).unwrap();
         assert_eq!(s.execute(id).await.unwrap_err().kind, "redirect");
     }
+    /// 验证启用时跟随重定向，禁用时保留原始重定向响应。
     #[tokio::test]
     async fn redirects_follow_when_enabled_and_remain_visible_when_disabled() {
         let (target, _) = server(
@@ -1204,6 +1326,7 @@ mod tests {
         let id = s.start(i).unwrap();
         assert_eq!(s.execute(id).await.unwrap().status, 302);
     }
+    /// 验证五个并发请求上限，以及不支持的 URL 协议在发送前被拒绝。
     #[test]
     fn max_five_and_unsupported_protocol_validation() {
         let s = HttpService::default();

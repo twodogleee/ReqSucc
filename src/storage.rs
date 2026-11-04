@@ -1,3 +1,7 @@
+//! SQLite 工作空间持久化、版本迁移和数据目录管理，保护已保存请求、会话草稿及源目录。
+//!
+//! 作者：Andersen
+
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -12,54 +16,83 @@ use std::{
 };
 use uuid::Uuid;
 
+/// 存储层统一结果类型，失败以适合界面展示的中文说明返回。
 type Result<T> = std::result::Result<T, String>;
+/// 当前支持的 SQLite 与目录清单模式版本，打开更高版本时拒绝修改。
 const SCHEMA: u32 = 2;
+/// 工作空间根目录内的 SQLite 数据库文件名。
 const DB: &str = "reqsucc.sqlite";
+/// 为底层 I/O 或数据库错误添加本地存储操作上下文。
 fn io(e: impl std::fmt::Display) -> String {
     format!("本地存储操作失败：{e}")
 }
+/// 数据目录身份清单，用于核对数据库归属及模式兼容性。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
+    /// 目录清单声明的模式版本，升级后与数据库版本同步。
     pub schema_version: u32,
+    /// 工作空间唯一标识，必须与数据库元数据一致。
     pub workspace_id: String,
 }
+/// 集合或子目录的持久化描述，层级由父标识表达。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Folder {
+    /// 目录稳定标识，用于请求归属和父子关系。
     pub id: String,
+    /// 用户可见目录名称，保存时不能为空白。
     pub name: String,
+    /// 父目录标识；None 表示根集合。
     pub parent: Option<String>,
 }
+/// 工作空间完整快照，分别保存接口版本、目录和包含草稿的会话数据。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// 快照所属工作空间标识，阻止跨空间误写。
     pub workspace_id: String,
+    /// 读取时的数据库修订号，保存时必须匹配当前值以阻止旧快照覆盖。
     pub revision: i64,
+    /// 按显示顺序排列的集合与子目录列表。
     pub folders: Vec<Folder>,
+    /// 已明确保存的接口配置，与标签中的编辑草稿分开保存。
     pub requests: Vec<Value>,
+    /// 标签草稿、比较基线、环境选择、显示偏好及网络配置等会话状态。
     pub session: Value,
 }
+/// 成功加载工作空间后回传界面的路径及快照。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Loaded {
+    /// 当前工作空间目录的显示路径。
     pub path: String,
+    /// 从该目录读取的完整工作空间快照。
     pub snapshot: Snapshot,
 }
+/// 配置目录内的工作空间位置记录，不保存接口业务数据。
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Bootstrap {
+    /// 下次启动应打开的工作空间目录。
     active_path: PathBuf,
+    /// 切换前的工作空间目录；首次定位时可为空。
     last_path: Option<PathBuf>,
 }
+/// 目录操作预检结果，供用户确认目标与空间需求。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePlan {
+    /// 当前工作空间路径；尚未打开空间时为空。
     pub source: Option<String>,
+    /// 经过校验和规范化的目标目录路径。
     pub target: String,
+    /// 迁移源目录计入复制的文件总大小，单位字节；非迁移操作为 0。
     pub bytes: u64,
+    /// 目标文件系统的可用容量，单位字节。
     pub available_bytes: u64,
 }
 
+/// 要求路径为现有绝对目录并拒绝路径本身为符号链接，返回规范化路径。
 fn checked_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err("请选择绝对路径的数据目录".into());
@@ -77,6 +110,7 @@ fn checked_path(path: &Path) -> Result<PathBuf> {
     }
     Ok(p)
 }
+/// 读取目录清单，拒绝符号链接、无效 JSON 结构和不支持的模式版本；空间身份由打开流程进一步核对。
 fn read_manifest(path: &Path) -> Result<Manifest> {
     let file = path.join("manifest.json");
     if fs::symlink_metadata(&file)
@@ -96,6 +130,7 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
     }
     Ok(m)
 }
+/// 在同目录写入临时 JSON 并刷盘后替换目标；Unix 下尽力同步父目录，避免部分配置写入。
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().ok_or("配置路径无效")?;
     let temp = tempfile::NamedTempFile::new_in(parent).map_err(io)?;
@@ -108,12 +143,15 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     }
     Ok(())
 }
+/// 读取必需的 JSON 字符串字段，缺失或类型错误时返回字段级诊断。
 fn str_field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("接口字段 {key} 无效"))
 }
+/// 检查可持久化请求的字段、协议、认证方式及参数行标识；允许尚未填写完成的请求草稿。
 fn validate_request(r: &Value) -> Result<()> {
+    crate::mqtt::validate_saved(r)?;
     for key in [
         "id",
         "name",
@@ -160,7 +198,9 @@ fn validate_request(r: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// 校验变量列表、环境标识、集合认证与默认网络限制，不展开变量或连接服务器。
 fn validate_network(v: &Value) -> Result<()> {
+    /// 检查变量列表是否符合 HTTP 键值行结构，避免无效类型进入持久化快照。
     fn rows(v: &Value) -> Result<()> {
         serde_json::from_value::<Vec<crate::http::Row>>(v.clone())
             .map_err(|_| "变量列表格式无效".to_string())?;
@@ -206,6 +246,7 @@ fn validate_network(v: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// 检查快照大小、目录关系、请求归属和草稿结构，保存前阻止不一致数据覆盖数据库。
 fn validate(snapshot: &Snapshot) -> Result<()> {
     if snapshot.folders.len() > 20000 || snapshot.requests.len() > 50000 {
         return Err("数据条目超过当前支持的上限".into());
@@ -269,6 +310,12 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
             "body",
             "description",
             "settings",
+            "message",
+            "topics",
+            "mqtt-auth",
+            "properties",
+            "will",
+            "mqtt-settings",
         ]
         .contains(&str_field(tab, "panel")?)
         {
@@ -308,13 +355,19 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
     }
     Ok(())
 }
+/// 持有单个工作空间的数据库连接和独占目录锁，负责快照读写及模式升级。
 pub struct Workspace {
+    /// 已规范化的工作空间目录，用于校验磁盘可用性和定位相关文件。
     path: PathBuf,
+    /// 已读取并核对的目录身份与模式版本。
     manifest: Manifest,
+    /// 当前工作空间 SQLite 连接，由存储线程串行使用。
     conn: Connection,
+    /// 持有目录独占锁的文件句柄，随工作空间释放而解除锁定。
     _lock: File,
 }
 impl Workspace {
+    /// 在现有空目录中创建数据库、清单和默认集合并持有独占锁；目标非空或初始化失败时返回错误。
     pub fn create(path: &Path) -> Result<Self> {
         let path = checked_path(path)?;
         if fs::read_dir(&path).map_err(io)?.next().is_some() {
@@ -367,6 +420,7 @@ impl Workspace {
         w.configure()?;
         Ok(w)
     }
+    /// 验证目录身份与数据库完整性并取得锁；旧模式先备份再升级，不创建缺失的数据库。
     pub fn open(path: &Path) -> Result<Self> {
         let path = checked_path(path)?;
         let manifest = read_manifest(&path)?;
@@ -448,6 +502,7 @@ impl Workspace {
         }
         Ok(w)
     }
+    /// 启用外键、WAL 和 FULL 同步，设置 3 秒数据库忙等待。
     fn configure(&self) -> Result<()> {
         self.conn.busy_timeout(Duration::from_secs(3)).map_err(io)?;
         self.conn
@@ -456,6 +511,7 @@ impl Workspace {
             )
             .map_err(io)
     }
+    /// 确认原目录及数据库仍存在、身份未变且可写；磁盘断开或只读时拒绝继续操作。
     fn ensure_available(&self) -> Result<()> {
         let manifest = read_manifest(&self.path)?;
         if manifest.workspace_id != self.manifest.workspace_id || !self.path.join(DB).is_file() {
@@ -476,6 +532,7 @@ impl Workspace {
         }
         Ok(())
     }
+    /// 按持久化顺序读取目录、已保存请求和会话草稿，携带当前修订号；磁盘或格式异常时返回错误。
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.ensure_available()?;
         let mut stmt = self
@@ -524,6 +581,7 @@ impl Workspace {
             session: serde_json::from_str(&session).map_err(io)?,
         })
     }
+    /// 校验空间身份与修订号后在事务内保存完整快照，成功返回递增后的修订号，失败不提交事务。
     pub fn save(&mut self, snapshot: Snapshot) -> Result<i64> {
         self.ensure_available()?;
         validate(&snapshot)?;
@@ -573,6 +631,7 @@ impl Workspace {
         tx.commit().map_err(io)?;
         Ok(revision + 1)
     }
+    /// 组装当前目录路径和快照，供界面加载或切换后使用。
     fn loaded(&self) -> Result<Loaded> {
         Ok(Loaded {
             path: self.path.to_string_lossy().into(),
@@ -581,12 +640,17 @@ impl Workspace {
     }
 }
 
+/// 管理启动配置和唯一活动工作空间，协调创建、打开、迁移及切换。
 pub struct StorageService {
+    /// 保存 bootstrap.json 的应用配置目录。
     config: PathBuf,
+    /// 尚无启动配置时使用的默认数据目录。
     default: PathBuf,
+    /// 当前持有目录锁的工作空间；加载前为 None。
     active: Option<Workspace>,
 }
 impl StorageService {
+    /// 记录配置目录及默认目录，暂不打开或创建工作空间。
     pub fn new(config: PathBuf, default: PathBuf) -> Self {
         Self {
             config,
@@ -594,6 +658,7 @@ impl StorageService {
             active: None,
         }
     }
+    /// 优先打开配置指向的目录，否则使用默认目录；已记录目录失效时返回错误，不静默创建替代数据库。
     pub fn load(&mut self) -> Result<Loaded> {
         if let Some(w) = &self.active {
             return w.loaded();
@@ -614,6 +679,7 @@ impl StorageService {
         self.active = Some(workspace);
         Ok(loaded)
     }
+    /// 原子更新启动配置中的活动目录和先前目录；失败时由调用方保留原活动空间。
     fn point_to(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(&self.config).map_err(io)?;
         atomic_json(
@@ -624,12 +690,14 @@ impl StorageService {
             },
         )
     }
+    /// 将快照交给当前活动工作空间保存；尚未加载空间时拒绝写入。
     pub fn save(&mut self, snapshot: Snapshot) -> Result<i64> {
         self.active
             .as_mut()
             .ok_or("数据空间尚未打开")?
             .save(snapshot)
     }
+    /// 预检 create、open 或 migrate 操作的路径、嵌套关系、清单与磁盘空间，不切换活动空间。
     pub fn plan(&self, path: &Path, mode: &str) -> Result<StoragePlan> {
         if !["create", "open", "migrate"].contains(&mode) {
             return Err("未知的目录操作".into());
@@ -667,6 +735,7 @@ impl StorageService {
             available_bytes: available,
         })
     }
+    /// 执行已校验的目录操作并更新启动配置；迁移保留源目录且核对数据库和附件，失败不替换活动空间。
     pub fn switch(&mut self, path: &Path, mode: &str) -> Result<Loaded> {
         let plan = self.plan(path, mode)?;
         let target = PathBuf::from(plan.target);
@@ -717,6 +786,7 @@ impl StorageService {
         Ok(loaded)
     }
 }
+/// 累计迁移文件大小，跳过缓存和锁文件；遇到符号链接时拒绝继续估算。
 fn tree_size(path: &Path) -> Result<u64> {
     let mut size = 0;
     for entry in fs::read_dir(path).map_err(io)? {
@@ -737,6 +807,7 @@ fn tree_size(path: &Path) -> Result<u64> {
     }
     Ok(size)
 }
+/// 分块计算文件的 SHA-256 摘要，供迁移后逐文件比对。
 fn digest(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(io)?;
     let mut hash = Sha256::new();
@@ -750,6 +821,7 @@ fn digest(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(hash.finalize().to_vec())
 }
+/// 递归复制普通文件并刷盘、核对摘要；源目录缺失则跳过，符号链接或特殊文件返回错误。
 fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     if !source.exists() {
         return Ok(());
@@ -791,17 +863,21 @@ fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 在临时目录验证持久化一致性、锁、升级恢复和目录迁移。
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 创建临时应用配置与默认数据路径，返回持有目录生命周期的测试环境。
     fn setup() -> (tempfile::TempDir, StorageService) {
         let t = tempfile::tempdir().unwrap();
         let s = StorageService::new(t.path().join("config"), t.path().join("data"));
         (t, s)
     }
+    /// 构造满足存储校验的最小测试请求。
     fn req() -> Value {
         json!({"id":"r1","name":"接口一","folder":"default","method":"POST","url":"http://localhost","params":[{"id":"p1","enabled":true,"key":"a","value":"1","description":""},{"id":"p2","enabled":false,"key":"a","value":"2","description":""}],"headers":[],"body":"{}","bodyType":"json","auth":"none","description":"","token":"","username":"","password":""})
     }
+    /// 验证重启后已保存接口与未保存草稿分别恢复。
     #[test]
     fn saved_and_draft_survive_restart_separately() {
         let (t, mut s) = setup();
@@ -818,6 +894,26 @@ mod tests {
         assert_eq!(x.session["tabs"][0]["request"]["url"], "http://unsaved");
         assert_eq!(x.requests[0]["params"].as_array().unwrap().len(), 2);
     }
+    /// 验证空白新标签的比较基线写入并在重启后恢复。
+    #[test]
+    fn new_tab_baseline_survives_storage_restart() {
+        use crate::model;
+
+        let (t, mut storage) = setup();
+        let mut snapshot = storage.load().unwrap().snapshot;
+        model::normalize(&mut snapshot);
+        model::new_tab(&mut snapshot, "");
+        storage.save(snapshot).unwrap();
+        drop(storage);
+
+        let mut storage = StorageService::new(t.path().join("config"), t.path().join("data"));
+        let mut restored = storage.load().unwrap().snapshot;
+        model::normalize(&mut restored);
+        assert!(!model::dirty(&model::tabs(&restored)[0]));
+        model::active_mut(&mut restored).unwrap()["mqtt"]["clientId"] = json!("custom-client");
+        assert!(model::dirty(&model::tabs(&restored)[0]));
+    }
+    /// 验证旧修订号和其他空间的快照不能覆盖当前数据库。
     #[test]
     fn stale_revision_and_workspace_cannot_overwrite() {
         let (_t, mut s) = setup();
@@ -828,6 +924,7 @@ mod tests {
         x.workspace_id = "other".into();
         assert!(s.save(x).is_err());
     }
+    /// 验证循环目录关系被拒绝且不会修改原数据库。
     #[test]
     fn cyclic_folders_do_not_change_database() {
         let (_t, mut s) = setup();
@@ -836,6 +933,7 @@ mod tests {
         assert!(s.save(x).is_err());
         assert!(s.load().unwrap().snapshot.folders[0].parent.is_none());
     }
+    /// 验证迁移保留源目录，并包含 WAL 中的数据及附件。
     #[test]
     fn migrate_keeps_source_and_copies_wal_and_attachments() {
         let (t, mut s) = setup();
@@ -868,6 +966,7 @@ mod tests {
             1
         );
     }
+    /// 验证创建或迁移拒绝非空、相同和互相嵌套的目标目录。
     #[test]
     fn reject_nonempty_same_and_nested_targets() {
         let (t, mut s) = setup();
@@ -882,6 +981,7 @@ mod tests {
         assert!(s.switch(&dest, "migrate").is_err());
         assert_eq!(fs::read_to_string(dest.join("important")).unwrap(), "keep");
     }
+    /// 验证配置指向的目录丢失时不会静默新建空数据库。
     #[test]
     fn missing_active_directory_never_creates_empty_database() {
         let (t, mut s) = setup();
@@ -892,12 +992,14 @@ mod tests {
         assert!(s.load().is_err());
         assert!(!t.path().join("data").exists());
     }
+    /// 验证目录独占锁阻止第二个工作空间实例写入。
     #[test]
     fn directory_lock_blocks_second_writer() {
         let (t, mut s) = setup();
         s.load().unwrap();
         assert!(Workspace::open(&t.path().join("data")).is_err());
     }
+    /// 验证高于支持版本的数据库拒绝打开且保持原版本。
     #[test]
     fn newer_schema_is_never_modified() {
         let (t, mut s) = setup();
@@ -910,6 +1012,7 @@ mod tests {
         assert!(Workspace::open(&t.path().join("data")).is_err());
         assert!(fs::read_to_string(path).unwrap().contains('9'));
     }
+    /// 验证启动配置写入失败时保留原活动工作空间。
     #[test]
     fn config_failure_rolls_back_active_pointer() {
         let (t, mut s) = setup();
@@ -928,6 +1031,7 @@ mod tests {
                 .to_string_lossy()
         );
     }
+    /// 验证打开其他空间只切换快照，不合并原空间内容。
     #[test]
     fn open_other_workspace_does_not_merge() {
         let (t, mut s) = setup();
@@ -953,6 +1057,7 @@ mod tests {
             1
         );
     }
+    /// 验证目录失联时拒绝保存，恢复原路径后可继续写入。
     #[test]
     fn disconnected_directory_rejects_write_then_recovers() {
         let (t, mut s) = setup();
@@ -965,6 +1070,7 @@ mod tests {
         s.save(x).unwrap();
         assert_eq!(s.load().unwrap().snapshot.requests.len(), 1);
     }
+    /// 验证无效请求结构被拒绝且原已保存数据不丢失。
     #[test]
     fn malformed_request_is_rejected_without_losing_saved_data() {
         let (_t, mut s) = setup();
@@ -976,6 +1082,7 @@ mod tests {
         assert!(s.save(x).is_err());
         assert_eq!(s.load().unwrap().snapshot.requests[0]["headers"], json!([]));
     }
+    /// 验证只读数据库保存返回失败，不报告虚假成功。
     #[cfg(unix)]
     #[test]
     fn readonly_database_does_not_report_success() {
@@ -989,6 +1096,7 @@ mod tests {
         fs::set_permissions(db, original).unwrap();
         s.save(x).unwrap();
     }
+    /// 验证第一版模式升级保留草稿，并生成可独立重新打开的旧版备份。
     #[test]
     fn version_one_upgrades_with_reopenable_backup_and_preserves_drafts() {
         let (t, mut service) = setup();
@@ -1024,6 +1132,7 @@ mod tests {
             1
         );
     }
+    /// 验证数据库已升级而清单未更新时，重新打开可补齐清单。
     #[test]
     fn incomplete_manifest_upgrade_finishes_on_reopen() {
         let (t, mut s) = setup();
@@ -1036,6 +1145,7 @@ mod tests {
         drop(Workspace::open(&path).unwrap());
         assert_eq!(read_manifest(&path).unwrap().schema_version, 2);
     }
+    /// 验证网络配置及扩展请求字段在重启和目录迁移后保持一致。
     #[test]
     fn network_configuration_and_new_request_fields_survive_restart_and_move() {
         let (t, mut s) = setup();

@@ -3,7 +3,7 @@
 .DS_Store
 *.local
 
-# Local secrets and application data
+# 本地敏感配置和应用数据，不纳入版本控制。
 .env
 .env.*
 !.env.example
@@ -14,3 +14,4 @@
 *.db-shm
 *.db-wal
 bootstrap.json
+AGENTS.md

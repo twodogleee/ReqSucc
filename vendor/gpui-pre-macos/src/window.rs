@@ -1,6 +1,7 @@
-// Modified by Andersen for ReqSucc, 2026-11-03: replace three unstable
-// Option::map_or_default calls with map_or_else(Default::default, ...).
-// See ../PATCHES.md for upstream provenance and patch details.
+// ReqSucc 本地兼容补丁，维护者：Andersen，首次修改于 2026-11-03。
+// 将三处尚未稳定的 Option::map_or_default 替换为等价的
+// map_or_else(Default::default, ...)，以兼容本项目的 stable Rust 工具链。
+// 本文件主体来自上游；来源和补丁范围见 ../PATCHES.md，保留上游署名与许可证。
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,

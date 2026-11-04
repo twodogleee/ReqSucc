@@ -1,3 +1,5 @@
+// ReqSucc 本地补丁，维护者：Andersen；启动时显式加载应用包图标，避免开发重打包后沿用旧 Dock 图标。
+// 本文件主体来自上游；来源和补丁范围见 ../PATCHES.md，保留上游署名与许可证。
 use crate::{
     AppleActivity, AppleDispatcher, BoolExt, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
     MacWindow, events::key_to_native, main_thread_marker, ns_string, pasteboard::Pasteboard,
@@ -1307,11 +1309,32 @@ extern "C-unwind" fn will_finish_launching(_this: &AnyObject, _: Sel, _: *mut An
     }
 }
 
+/// 响应原生应用启动完成事件，设置激活策略并注册系统通知。
+/// ReqSucc 在此回调中补充应用包图标刷新，其余启动流程沿用上游实现。
 extern "C-unwind" fn did_finish_launching(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     unsafe {
         let app: *mut AnyObject = msg_send![APP_CLASS, sharedApplication];
         let policy = get_mac_platform(this).0.lock().activation_policy;
         let _: Bool = msg_send![app, setActivationPolicy: native_activation_policy(policy)];
+
+        // ReqSucc 补丁：相同包标识的开发应用原地重打包后，Launch Services 可能仍缓存旧 Dock 图标。
+        // 在应用启动回调中从当前包重新加载；配置、路径或图像为空时跳过，保持系统原有图标。
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+        let icon_name: *mut AnyObject = msg_send![bundle,
+            objectForInfoDictionaryKey: ns_string("CFBundleIconFile")];
+        if !icon_name.is_null() {
+            let icon_path: *mut AnyObject = msg_send![bundle,
+                pathForResource: icon_name, ofType: ptr::null_mut::<AnyObject>()];
+            if !icon_path.is_null() {
+                let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                let image: *mut AnyObject = msg_send![image, initWithContentsOfFile: icon_path];
+                if !image.is_null() {
+                    let _: () = msg_send![app, setApplicationIconImage: image];
+                    // 释放 alloc/init 获得的本地所有权；应用负责持有已设置的图标。
+                    let _: () = msg_send![image, release];
+                }
+            }
+        }
 
         let notification_center: *mut AnyObject =
             msg_send![class!(NSNotificationCenter), defaultCenter];

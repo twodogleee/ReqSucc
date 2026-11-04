@@ -1,6 +1,7 @@
--- v2 adds environment/global/collection configuration to the session JSON,
--- and API Key, inherited auth, forms and per-request options to request JSON.
--- Version gating prevents older clients from silently dropping these fields.
+-- 前置条件为第一版工作空间结构；存储层负责已有数据的升级前备份及清单版本更新。
+-- 第二版在会话 JSON 中增加环境、全局和集合配置，在请求 JSON 中增加
+-- API Key、认证继承、表单和请求级选项；无需新增数据库列，默认值由应用层补齐。
+-- 提升模式版本，阻止旧客户端在不了解扩展字段时写回并静默丢失数据。
 BEGIN IMMEDIATE;
 PRAGMA user_version = 2;
 COMMIT;

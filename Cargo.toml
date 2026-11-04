@@ -25,9 +25,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "g
 tokio = { version = "1", features = ["macros", "time", "sync", "fs", "io-util", "net", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 encoding_rs = "0.8"
 url = "2"
 dirs = "6"
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 
 [profile.dev]
 debug = 0
