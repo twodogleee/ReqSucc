@@ -73,7 +73,8 @@ jobs:
       - name: 验证 Windows 链接工具链
         if: runner.os == 'Windows'
         run: |
-          $resolvedLink = (Get-Command link.exe -CommandType Application).Source
+          # Windows 可返回多个同名程序，只校验 PATH 中优先执行的第一项。
+          $resolvedLink = (Get-Command link.exe -CommandType Application | Select-Object -First 1).Source
           if ($resolvedLink -ne $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER) {
             throw "链接器路径错误：$resolvedLink"
           }
