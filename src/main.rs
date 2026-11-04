@@ -16,6 +16,8 @@ mod messaging;
 mod model;
 /// MQTT V5 连接、发布、订阅与临时消息记录。
 mod mqtt;
+/// Postman 本地集合和环境导入转换。
+mod postman;
 /// 应用快捷键配置、冲突校验与动态注册。
 mod shortcuts;
 /// SQLite 持久化、数据目录切换与迁移。

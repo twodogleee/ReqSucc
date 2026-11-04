@@ -223,8 +223,8 @@ async fn run(
             }
             incoming = socket.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(value))) => messaging::with(&state, |live| live.log("接收", "文本帧", &messaging::payload_preview(value.as_bytes(), false))),
-                    Some(Ok(Message::Binary(value))) => messaging::with(&state, |live| live.log("接收", "二进制帧", &messaging::payload_preview(&value, true))),
+                    Some(Ok(Message::Text(value))) => messaging::with(&state, |live| live.log_message("接收", "文本帧", "", value.as_bytes(), false)),
+                    Some(Ok(Message::Binary(value))) => messaging::with(&state, |live| live.log_message("接收", "二进制帧", "", &value, true)),
                     Some(Ok(Message::Ping(value))) => {
                         messaging::with(&state, |live| live.log("控制", "收到 Ping，自动回复 Pong", &messaging::payload_preview(&value, true)));
                         tokio::select! { _ = cancel.cancelled() => return Ok(()), result = tokio::time::timeout(timeout, socket.flush()) => result.map_err(|_| "Pong 发送超时")?.map_err(error)? }
@@ -242,18 +242,23 @@ async fn run(
             }
             command = rx.recv() => {
                 let Some(command) = command else { return Ok(()); };
-                let (message, summary, detail) = match command {
+                let (message, summary) = match command {
                     Command::Send(outgoing) => {
-                        let detail = messaging::payload_preview(&outgoing.payload, outgoing.binary);
                         let message = if outgoing.binary { Message::Binary(outgoing.payload.into()) } else { Message::Text(String::from_utf8(outgoing.payload).map_err(|_| "文本消息不是 UTF-8")?.into()) };
-                        (message, "消息已写入连接", detail)
+                        (message, "消息已写入连接")
                     }
-                    Command::Ping => (Message::Ping(Vec::new().into()), "已发送 Ping", String::new()),
+                    Command::Ping => (Message::Ping(Vec::new().into()), "已发送 Ping"),
                     _ => { messaging::with(&state, |live| live.complete(Err("此操作不适用于 WebSocket".into()))); continue; }
                 };
-                let result = tokio::select! { _ = cancel.cancelled() => return Ok(()), result = tokio::time::timeout(timeout, socket.send(message)) => result.map_err(|_| "WebSocket 发送超时".to_owned()).and_then(|result| result.map_err(error)) };
+                let result = tokio::select! { _ = cancel.cancelled() => return Ok(()), result = tokio::time::timeout(timeout, socket.send(message.clone())) => result.map_err(|_| "WebSocket 发送超时".to_owned()).and_then(|result| result.map_err(error)) };
                 // 写入成功不代表业务服务端已处理；接收的响应独立记录。
-                if result.is_ok() { messaging::with(&state, |live| live.log("发送", summary, &detail)); }
+                if result.is_ok() {
+                    messaging::with(&state, |live| match &message {
+                        Message::Text(value) => live.log_message("发送", summary, "", value.as_bytes(), false),
+                        Message::Binary(value) => live.log_message("发送", summary, "", value, true),
+                        _ => live.log("发送", summary, ""),
+                    });
+                }
                 result?;
                 messaging::with(&state, |live| live.complete(Ok(())));
             }

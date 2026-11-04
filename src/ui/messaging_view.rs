@@ -4,7 +4,39 @@
 
 use super::*;
 
+/// JSON 模板格式化失败提示，成功重试后仅清除此类错误。
+const MESSAGE_FORMAT_ERROR: &str = "JSON 格式错误，请检查消息内容和变量占位符。原文未修改。";
+
 impl Workbench {
+    /// 格式化当前协议的 JSON 草稿；不展开变量、不发送消息，失败时保留原文。
+    pub(super) fn message_format(&mut self, cx: &mut Context<Self>) {
+        if !self.ready || self.busy || !self.is_messaging() {
+            return;
+        }
+        let Some(request) = model::active(&self.doc) else {
+            return;
+        };
+        let protocol = text(request, "protocol");
+        let payload = text(&request[&protocol], "payload");
+        if request[&protocol]["format"] != "json" || payload.trim().is_empty() {
+            return;
+        }
+        match mqtt::format_json_template(&payload) {
+            Ok(formatted) => {
+                self.write(
+                    &Binding::Request(format!("/{protocol}/payload")),
+                    json!(formatted),
+                    cx,
+                );
+                self.body = None;
+                self.body_key.clear();
+                if self.error == MESSAGE_FORMAT_ERROR {
+                    self.error.clear();
+                }
+            }
+            Err(_) => self.error = MESSAGE_FORMAT_ERROR.into(),
+        }
+    }
     /// 判断活动请求是否使用统一消息会话。
     pub(super) fn is_messaging(&self) -> bool {
         model::active(&self.doc)
@@ -73,7 +105,7 @@ impl Workbench {
     pub(super) fn message_operation(&mut self, operation: &str, cx: &mut Context<Self>) {
         let id = text(&self.doc.session, "activeId");
         if operation == "copy" {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.message_detail()));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.message_detail(false)));
             return;
         }
         if operation == "clear" {
@@ -495,6 +527,19 @@ impl Workbench {
                             .disabled(!ready),
                     );
                 }
+                toolbar = toolbar.child(
+                    self.button(
+                        "message-format-json",
+                        "格式化 JSON",
+                        Action::MessageFormat,
+                        cx,
+                    )
+                    .ghost()
+                    .disabled(
+                        request[&protocol]["format"] != "json"
+                            || text(&request[&protocol], "payload").trim().is_empty(),
+                    ),
+                );
                 content
                     .child(toolbar)
                     .child(
@@ -740,8 +785,8 @@ impl Workbench {
         }
         content.into_any_element()
     }
-    /// 返回当前选择记录的有界详情，选择已被淘汰时回退到最新记录。
-    fn message_detail(&self) -> String {
+    /// 返回所选记录详情，显示时格式化完整 JSON，复制保留原文；失效选择回退到最新记录。
+    fn message_detail(&self, formatted: bool) -> String {
         let id = text(&self.doc.session, "activeId");
         self.message_sessions
             .get(&id)
@@ -757,7 +802,11 @@ impl Workbench {
                                 messaging::format_timestamp(r.timestamp),
                                 r.kind,
                                 r.summary,
-                                r.detail
+                                if formatted {
+                                    r.display_detail()
+                                } else {
+                                    r.detail.clone()
+                                }
                             )
                         })
                 })
@@ -850,7 +899,7 @@ impl Workbench {
             .unwrap_or(records[0].id);
         let key = format!("message:{id}:{selected}");
         if self.response_key != key || self.response_editor.is_none() {
-            let detail = self.message_detail();
+            let detail = self.message_detail(true);
             self.response_editor = Some(cx.new(|cx| {
                 EditorState::new(window, cx)
                     .language("plain")

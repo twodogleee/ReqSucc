@@ -10,6 +10,8 @@ use controls::*;
 mod messaging_view;
 /// MQTT 协议切换、连接配置、发布用例和消息详情界面。
 mod mqtt_view;
+/// Postman 文件选择、导入预览与事务结果反馈。
+mod postman_view;
 use crate::{kafka, messaging, websocket};
 /// 应用快捷键设置页与按键录入交互。
 mod shortcuts_view;
@@ -115,6 +117,12 @@ impl Binding {
 /// 工作台统一交互命令，由入口集中检查状态并分派模型和后台操作。
 #[derive(Clone)]
 enum Action {
+    /// 选择本地 Postman 集合或环境 JSON 并生成导入预览。
+    ChoosePostman,
+    /// 将已预览内容追加保存到当前工作空间。
+    ImportPostman,
+    /// 丢弃导入预览，不修改已保存内容。
+    CancelPostman,
     /// 切回请求页、展开侧栏并将焦点移到搜索框。
     SearchFocus,
     /// 切换侧栏展开状态并保存显示偏好。
@@ -147,6 +155,8 @@ enum Action {
     Protocol(String),
     /// 提交消息协议操作，参数为操作名称。
     MessageOp(String),
+    /// 格式化当前 WebSocket 或 Kafka JSON 消息草稿，保留变量和原始值。
+    MessageFormat,
     /// 展示指定记录的详情。
     MessageRecord(u64),
     /// 确认删除指定 Kafka 主题，绑定标签和会话避免误操作。
@@ -341,6 +351,14 @@ pub struct Workbench {
     search: String,
     /// 待确认的目录操作模式及预检结果，取消或执行后清空。
     plan: Option<(String, StoragePlan)>,
+    /// 是否正在后台读取 Postman 导出文件，阻止重复选择。
+    postman_loading: bool,
+    /// 导入事务在途标记，关闭窗口及退出时禁止旧快照覆盖导入结果。
+    postman_saving: bool,
+    /// 所属工作空间和待确认的导入内容，目录切换后失效。
+    postman_plan: Option<(String, crate::postman::Plan)>,
+    /// 最近一次导入的完成说明，不包含敏感值。
+    postman_notice: String,
     /// 工作台焦点句柄，用于键盘事件上下文。
     focus: FocusHandle,
     /// 请求标签条的横向滚动状态。
@@ -496,7 +514,9 @@ impl Workbench {
         });
         task.detach();
         cx.on_app_quit(|this, _| {
-            if this.ready {
+            if this.postman_saving {
+                this.backend.wait_pending();
+            } else if this.ready {
                 let _ = this.backend.flush(this.doc.clone());
             }
             this.http.clear();
@@ -548,6 +568,10 @@ impl Workbench {
             raw: false,
             search: String::new(),
             plan: None,
+            postman_loading: false,
+            postman_saving: false,
+            postman_plan: None,
+            postman_notice: String::new(),
             tab_scroll: ScrollHandle::new(),
             tab_menu: None,
             tab_menu_subscription: None,
@@ -565,6 +589,11 @@ impl Workbench {
     }
     /// 同步保存最新草稿并更新修订号；失败展示错误且返回 false，供关闭或切换流程中止。
     fn flush(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.postman_saving {
+            self.error = "正在保存导入数据，请完成后再关闭窗口".into();
+            cx.notify();
+            return false;
+        }
         if !self.ready {
             return true;
         }
@@ -603,6 +632,35 @@ impl Workbench {
         while let Ok(event) = self.rx.try_recv() {
             notify = true;
             match event {
+                Event::PostmanPrepared(workspace, result) => {
+                    self.postman_loading = false;
+                    if workspace == self.doc.workspace_id {
+                        match result {
+                            Ok(plan) => self.postman_plan = Some((workspace, plan)),
+                            Err(error) => self.error = error,
+                        }
+                    }
+                }
+                Event::PostmanImported(result) => {
+                    self.postman_saving = false;
+                    self.busy = false;
+                    match result {
+                        Ok(snapshot) => {
+                            self.doc = snapshot;
+                            self.saved = self.generation;
+                            self.queued = self.generation;
+                            self.postman_notice = self
+                                .postman_plan
+                                .take()
+                                .map(|(_, plan)| format!("导入完成：{}", plan.summary()))
+                                .unwrap_or_else(|| "导入完成".into());
+                            self.status = "Postman 数据已导入并保存".into();
+                            self.error.clear();
+                            self.reset_fields();
+                        }
+                        Err(error) => self.error = format!("导入失败，原数据未改变：{error}"),
+                    }
+                }
                 Event::Loaded(result) => {
                     self.busy = false;
                     match result {
@@ -632,6 +690,8 @@ impl Workbench {
                             self.error.clear();
                             self.status = "草稿已保存".into();
                             self.plan = None;
+                            self.postman_plan = None;
+                            self.postman_notice.clear();
                             self.http.clear();
                             self.runs.clear();
                             self.mqtt_sessions.clear();
@@ -697,6 +757,9 @@ impl Workbench {
                     Err(e) => self.error = e,
                 },
             }
+        }
+        if self.postman_saving {
+            self.busy = true;
         }
         if self.ready
             && !self.busy
@@ -962,7 +1025,9 @@ impl Workbench {
         let icon = match &action {
             Action::Save => Some(Icon::new(Glyph::Save)),
             Action::Send => Some(Icon::new(Glyph::Send)),
-            Action::Format | Action::MqttFormat => Some(Icon::new(Glyph::Braces)),
+            Action::Format | Action::MqttFormat | Action::MessageFormat => {
+                Some(Icon::new(Glyph::Braces))
+            }
             Action::Copy => Some(Icon::new(IconName::Copy)),
             Action::Export => Some(Icon::new(Glyph::Download)),
             Action::New
@@ -1174,7 +1239,11 @@ impl Workbench {
         self.shortcut_recording = None;
         self.shortcut_capture = None;
         match a {
+            Action::ChoosePostman => self.choose_postman(window, cx),
+            Action::ImportPostman => self.import_postman(cx),
+            Action::CancelPostman => self.postman_plan = None,
             Action::MessageOp(op) => self.message_operation(&op, cx),
+            Action::MessageFormat => self.message_format(cx),
             Action::MessageRecord(record) => {
                 self.message_selected
                     .insert(text(&self.doc.session, "activeId"), record);
@@ -3203,6 +3272,7 @@ impl Workbench {
                                     )),
                             ),
                     );
+                content = content.child(self.postman_settings(cx));
                 if let Some((mode, plan)) = &self.plan {
                     content = content.child(
                         self.setting_card("确认目录操作", "请核对目标位置后继续。", cx)
@@ -4279,7 +4349,9 @@ impl Render for Workbench {
                             .child(Icon::new(IconName::HardDrive).small())
                             .child("本地模式"),
                     )
-                    .left(if self.busy {
+                    .left(if self.postman_saving {
+                        "正在导入 Postman 数据…".to_owned()
+                    } else if self.busy {
                         "正在处理数据目录，请稍候…".to_owned()
                     } else {
                         self.status.clone()

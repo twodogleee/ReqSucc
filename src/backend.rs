@@ -10,6 +10,10 @@ use std::{path::PathBuf, sync::mpsc};
 
 /// 后台任务回传界面的结果，携带定位请求或保存批次所需的标识。
 pub enum Event {
+    /// 本地导入解析回执，工作空间标识用于丢弃目录切换前的结果。
+    PostmanPrepared(String, Result<crate::postman::Plan, String>),
+    /// 导入事务保存结果，只有写入成功后才替换界面快照。
+    PostmanImported(Result<Snapshot, String>),
     /// 草稿保存回执，依次携带界面变更代数及数据库新修订号或错误。
     Saved(u64, Result<i64, String>),
     /// 数据目录加载或切换结果，成功时包含目录路径及完整快照。
@@ -23,6 +27,10 @@ pub enum Event {
 }
 /// 存储线程按顺序消费的命令，避免并发写入和目录切换越过保存队列。
 enum Command {
+    /// 等待此前所有写入结束，不使用旧界面快照覆盖导入结果。
+    Barrier(mpsc::SyncSender<()>),
+    /// 将预览内容追加到当前快照并通过现有事务一次性保存。
+    ImportPostman(Snapshot, crate::postman::Plan),
     /// 异步保存草稿，依次携带界面变更代数及待保存快照。
     Save(u64, Snapshot),
     /// 同步刷盘，依次携带最新快照及返回数据库修订号或错误的确认通道。
@@ -41,6 +49,23 @@ pub struct Backend {
     tx: mpsc::Sender<Command>,
 }
 impl Backend {
+    /// 退出时等待已经提交的导入事务结束，保持其结果而不追加旧快照保存。
+    pub fn wait_pending(&self) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if self.tx.send(Command::Barrier(tx)).is_ok() {
+            let _ = rx.recv();
+        }
+    }
+    /// 排队提交导入事务，通道关闭时保留界面原快照并返回错误。
+    pub fn import_postman(
+        &self,
+        snapshot: Snapshot,
+        plan: crate::postman::Plan,
+    ) -> Result<(), String> {
+        self.tx
+            .send(Command::ImportPostman(snapshot, plan))
+            .map_err(|_| "存储线程已退出，未导入任何内容".into())
+    }
     /// 创建串行存储线程并立即排队加载数据；config 为配置目录，default 为默认数据目录。
     pub fn new(config: PathBuf, default: PathBuf, events: mpsc::Sender<Event>) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -50,6 +75,24 @@ impl Backend {
             let mut save_failed = false;
             for command in rx {
                 match command {
+                    Command::Barrier(ack) => {
+                        let _ = ack.send(());
+                    }
+                    Command::ImportPostman(mut snapshot, plan) => {
+                        if let Some(r) = revision {
+                            snapshot.revision = r;
+                        }
+                        let result = plan.merge(&snapshot).and_then(|mut merged| {
+                            let saved = service.save(merged.clone())?;
+                            merged.revision = saved;
+                            Ok(merged)
+                        });
+                        if let Ok(snapshot) = &result {
+                            revision = Some(snapshot.revision);
+                            save_failed = false;
+                        }
+                        let _ = events.send(Event::PostmanImported(result));
+                    }
                     Command::Load => {
                         let result = service.load();
                         if let Ok(v) = &result {

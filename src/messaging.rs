@@ -62,6 +62,24 @@ pub struct Record {
     pub summary: String,
     /// 有界详情，二进制消息使用 Base64 展示。
     pub detail: String,
+    /// 完整文本正文在详情中的 UTF-8 字节起点；二进制、截断或非消息记录不设置。
+    payload_start: Option<usize>,
+}
+
+impl Record {
+    /// 仅排版完整 JSON 正文，保留元数据、重复键和数值写法，复制仍使用原始详情。
+    pub fn display_detail(&self) -> String {
+        let Some(start) = self.payload_start else {
+            return self.detail.clone();
+        };
+        let payload = &self.detail[start..];
+        if serde_json::from_str::<serde::de::IgnoredAny>(payload).is_err() {
+            return self.detail.clone();
+        }
+        crate::mqtt::format_json_template(payload)
+            .map(|formatted| preview(&format!("{}{formatted}", &self.detail[..start])))
+            .unwrap_or_else(|_| self.detail.clone())
+    }
 }
 
 /// 将毫秒时间戳转换为本机完整日期、时间、毫秒及 UTC 偏移；非法值不伪装成当前时间。
@@ -129,6 +147,30 @@ impl Live {
     }
     /// 添加有界记录并通知界面，最多保留最近 500 条。
     pub fn log(&mut self, kind: &str, summary: &str, detail: &str) {
+        self.append(kind, summary, detail, None);
+    }
+    /// 分开记录元数据和消息正文，仅完整 UTF-8 文本允许在详情中自动格式化 JSON。
+    pub fn log_message(
+        &mut self,
+        kind: &str,
+        summary: &str,
+        metadata: &str,
+        payload: &[u8],
+        binary: bool,
+    ) {
+        let complete_text = !binary
+            && metadata.len() + payload.len() <= MAX_PREVIEW
+            && std::str::from_utf8(payload).is_ok();
+        let detail = format!("{metadata}{}", payload_preview(payload, binary));
+        self.append(
+            kind,
+            summary,
+            &detail,
+            complete_text.then_some(metadata.len()),
+        );
+    }
+    /// 统一写入有界记录，正文边界仅由已校验的消息入口提供。
+    fn append(&mut self, kind: &str, summary: &str, detail: &str, payload_start: Option<usize>) {
         self.sequence += 1;
         self.records.push_back(Arc::new(Record {
             id: self.sequence,
@@ -136,6 +178,7 @@ impl Live {
             kind: kind.into(),
             summary: preview(summary),
             detail: preview(detail),
+            payload_start,
         }));
         while self.records.len() > MAX_RECORDS {
             self.records.pop_front();

@@ -3,6 +3,51 @@
 use super::*;
 use serde_json::json;
 
+/// 验证 WS 和 Kafka 完整正文自动排版，元数据、重复键、数值写法及复制原文保持不变。
+#[test]
+fn formats_complete_json_messages_without_changing_raw_detail() {
+    let mut live = Live::new();
+    let payload = r#"{"n":1e+02,"n":1234567890123456789012345,"text":"中文","a":[true,null]}"#;
+    for metadata in [
+        "",
+        "分区：0 · 位移：1\n头 trace：\n消息：\n原始值\n\n消息：\n",
+    ] {
+        live.log_message("接收", "测试", metadata, payload.as_bytes(), false);
+        let record = live.records.back().unwrap();
+        let formatted = record.display_detail();
+        assert!(formatted.starts_with(metadata));
+        assert!(formatted.contains("\n  \"n\": 1e+02,"));
+        assert!(formatted.contains("\"n\": 1234567890123456789012345"));
+        assert_eq!(record.detail, format!("{metadata}{payload}"));
+    }
+}
+
+/// 验证二进制、非法 JSON、截断正文和非消息记录不被格式化，排版预览仍受容量限制。
+#[test]
+fn leaves_binary_invalid_and_truncated_messages_unformatted() {
+    let mut live = Live::new();
+    let oversized = format!("{{\"text\":\"{}\"}}", "中".repeat(MAX_PREVIEW));
+    for (payload, binary) in [
+        (b"{\"a\":1}".as_slice(), true),
+        (b"{\"a\":{{value}}}", false),
+        (oversized.as_bytes(), false),
+        (&[255, 0], false),
+    ] {
+        live.log_message("接收", "测试", "", payload, binary);
+        let record = live.records.back().unwrap();
+        assert_eq!(record.display_detail(), record.detail);
+    }
+    live.log("连接", "事件", "{\"a\":1}");
+    let record = live.records.back().unwrap();
+    assert_eq!(record.display_detail(), record.detail);
+    let dense = format!("[{}0]", "0,".repeat(3000));
+    live.log_message("发送成功", "主题", "", dense.as_bytes(), false);
+    let record = live.records.back().unwrap();
+    assert!(record.display_detail().contains("截断"));
+    assert!(record.display_detail().len() < MAX_PREVIEW + 100);
+    assert_eq!(record.detail, dense);
+}
+
 /// 验证完整日期、毫秒和时区偏移，跨日显示不会只剩时分秒，非法时间戳明确标记。
 #[test]
 fn message_timestamps_preserve_date_milliseconds_and_timezone() {

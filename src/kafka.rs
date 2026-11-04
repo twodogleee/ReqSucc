@@ -491,13 +491,14 @@ fn run(
                         }
                     }
                     detail.push_str("\n消息：\n");
-                    detail.push_str(
-                        &message
-                            .payload()
-                            .map(|bytes| messaging::payload_preview(bytes, false))
-                            .unwrap_or_else(|| "null（墓碑消息）".into()),
-                    );
-                    messaging::with(&state, |live| live.log("接收", message.topic(), &detail));
+                    messaging::with(&state, |live| {
+                        if let Some(payload) = message.payload() {
+                            live.log_message("接收", message.topic(), &detail, payload, false);
+                        } else {
+                            detail.push_str("null（墓碑消息）");
+                            live.log("接收", message.topic(), &detail);
+                        }
+                    });
                 }
                 Err(failure) => {
                     let message = error(failure);
@@ -566,15 +567,15 @@ fn execute(
             )?
             .map_err(|(failure, _)| error(failure))?;
             messaging::with(state, |live| {
-                live.log(
+                live.log_message(
                     "发送成功",
                     &outgoing.topic,
                     &format!(
-                        "服务器确认：分区 {} · 位移 {}\n{}",
-                        delivery.partition,
-                        delivery.offset,
-                        messaging::payload_preview(&outgoing.payload, outgoing.binary)
+                        "服务器确认：分区 {} · 位移 {}\n",
+                        delivery.partition, delivery.offset,
                     ),
+                    &outgoing.payload,
+                    outgoing.binary,
                 )
             });
         }
