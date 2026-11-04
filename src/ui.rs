@@ -121,8 +121,12 @@ enum Action {
     Save,
     /// 请求关闭指定标签，必要时先确认丢弃未保存修改。
     Close(String),
-    /// 确认关闭指定标签，并记住本次运行已接受未保存标签的丢弃提示。
-    ConfirmClose(String),
+    /// 按目标标签及排列范围请求批量关闭。
+    CloseTabs(String, model::TabCloseScope),
+    /// 确认丢弃指定标签的修改，保存确认时的标识集合以防关闭范围变化。
+    ConfirmCloseTabs(Vec<String>),
+    /// 复制目标标签的当前草稿，并激活独立副本。
+    DuplicateTab(String),
     /// 激活指定请求标签，重建编辑控件。
     Select(String),
     /// 打开传入的请求 JSON，已打开时保留其现有草稿。
@@ -311,6 +315,10 @@ pub struct Workbench {
     focus: FocusHandle,
     /// 请求标签条的横向滚动状态。
     tab_scroll: ScrollHandle,
+    /// 当前标签右键菜单及鼠标位置，菜单退出时清空。
+    tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>)>,
+    /// 当前右键菜单的关闭事件订阅，独立于编辑器订阅以免切换标签时丢失。
+    tab_menu_subscription: Option<Subscription>,
     /// 最近已自动滚入视野的活动标签标识，避免每次渲染都重置滚动。
     visible_tab: String,
 }
@@ -493,6 +501,8 @@ impl Workbench {
             search: String::new(),
             plan: None,
             tab_scroll: ScrollHandle::new(),
+            tab_menu: None,
+            tab_menu_subscription: None,
             visible_tab: String::new(),
             focus: {
                 let focus = cx.focus_handle();
@@ -1145,29 +1155,22 @@ impl Workbench {
                 self.changed(cx);
             }
             Action::Close(id) => {
-                // 模态确认结束前不能关闭其他标签，快捷键触发的关闭也必须遵守此边界。
-                if window.has_active_dialog(cx) {
-                    return;
-                }
-                if !self.confirmed_unsaved_tab_close
-                    && model::tabs(&self.doc)
-                        .iter()
-                        .any(|t| text(t, "id") == id && model::dirty(t))
-                {
-                    self.confirm(
-                        "关闭未保存的请求？",
-                        "关闭后将丢弃此标签的修改。本次运行期间再次关闭未保存的标签时，将直接丢弃修改，不再提醒；需要保留请先保存接口。正常退出应用会自动恢复草稿。".into(),
-                        Action::ConfirmClose(id),
-                        window,
-                        cx,
-                    );
-                } else {
-                    self.close_tab(&id, cx)
-                }
+                self.request_close_tabs(&id, model::TabCloseScope::Current, window, cx);
             }
-            Action::ConfirmClose(id) => {
+            Action::CloseTabs(id, scope) => {
+                self.request_close_tabs(&id, scope, window, cx);
+            }
+            Action::ConfirmCloseTabs(ids) => {
                 self.confirmed_unsaved_tab_close = true;
-                self.close_tab(&id, cx);
+                self.close_tabs(&ids, cx);
+            }
+            Action::DuplicateTab(id) => {
+                if model::duplicate_tab(&mut self.doc, &id).is_some() {
+                    self.screen = "requests".into();
+                    self.response_tab = "body".into();
+                    self.reset_fields();
+                    self.changed(cx);
+                }
             }
             Action::Panel(panel) => {
                 if let Some(i) = model::active_index(&self.doc) {
@@ -1580,10 +1583,95 @@ impl Workbench {
         }
         cx.notify();
     }
-    /// 移除指定标签、释放协议运行资源并触发草稿保存；调用前应已完成必要确认。
-    fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
-        model::close(&mut self.doc, id);
-        self.release(id);
+    /// 在右键位置显示标准菜单；操作始终绑定目标标签，不改变当前活动标签。
+    fn show_tab_menu(
+        &mut self,
+        id: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || window.has_active_dialog(cx) {
+            return;
+        }
+        let mut items = vec![("复制标签", Action::DuplicateTab(id.into()), false)];
+        for (label, scope) in [
+            ("关闭当前标签", model::TabCloseScope::Current),
+            ("关闭其他标签", model::TabCloseScope::Others),
+            ("关闭左侧所有标签", model::TabCloseScope::Left),
+            ("关闭右侧所有标签", model::TabCloseScope::Right),
+            ("关闭全部标签", model::TabCloseScope::All),
+        ] {
+            let disabled = model::tab_close_ids(&self.doc, id, scope).is_empty();
+            items.push((label, Action::CloseTabs(id.into(), scope), disabled));
+        }
+        let entity = cx.entity().downgrade();
+        let focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let width = self.scaled(200.);
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let mut menu = menu.min_w(width).action_context(focus);
+            for (index, (label, action, disabled)) in items.into_iter().enumerate() {
+                if index == 1 || index == 5 {
+                    menu = menu.separator();
+                }
+                let entity = entity.clone();
+                menu = menu.item(PopupMenuItem::new(label).disabled(disabled).on_click(
+                    move |_, window, cx| {
+                        let _ = entity.update(cx, |this, cx| this.act(action.clone(), window, cx));
+                    },
+                ));
+            }
+            menu
+        });
+        self.tab_menu_subscription = Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.tab_menu = None;
+            this.tab_menu_subscription = None;
+            cx.notify();
+        }));
+        menu.focus_handle(cx).focus(window, cx);
+        self.tab_menu = Some((menu, position));
+        cx.notify();
+    }
+
+    /// 在任何标签被移除前统一检查未保存修改；确认窗口保留此次范围内的标识快照。
+    fn request_close_tabs(
+        &mut self,
+        id: &str,
+        scope: model::TabCloseScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let ids = model::tab_close_ids(&self.doc, id, scope);
+        if ids.is_empty() {
+            return;
+        }
+        let dirty = model::tabs(&self.doc)
+            .iter()
+            .filter(|tab| ids.contains(&text(tab, "id")) && model::dirty(tab))
+            .count();
+        if !self.confirmed_unsaved_tab_close && dirty > 0 {
+            self.confirm(
+                "关闭未保存的请求？",
+                format!("将关闭 {} 个标签，其中 {} 个含有未保存修改，关闭后这些修改将被丢弃。本次运行期间再次关闭未保存的标签时，将直接丢弃修改，不再提醒；需要保留请先保存接口。正常退出应用会自动恢复草稿。", ids.len(), dirty),
+                Action::ConfirmCloseTabs(ids), window, cx,
+            );
+        } else {
+            self.close_tabs(&ids, cx);
+        }
+    }
+
+    /// 批量移除标签并逐一释放协议资源，仅刷新一次编辑控件和草稿保存状态。
+    fn close_tabs(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        let removed = model::close_tabs(&mut self.doc, ids);
+        if removed.is_empty() {
+            return;
+        }
+        for id in removed {
+            self.release(&id);
+        }
         self.reset_fields();
         self.changed(cx);
     }
@@ -3691,6 +3779,16 @@ impl Render for Workbench {
                     let drag_order = tab_order.clone();
                     tabs = tabs.child(
                         Tab::new()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener({
+                                    let id = id.clone();
+                                    move |this, event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.show_tab_menu(&id, event.position, window, cx);
+                                    }
+                                }),
+                            )
                             .label(name.clone())
                             .aria_label(format!("{method} {name}"))
                             .prefix(badge)
@@ -3906,6 +4004,18 @@ impl Render for Workbench {
                     .child(rail)
                     .child(div().flex_1().min_w_0().h_full().child(work)),
             )
+            .when_some(self.tab_menu.clone(), |el, (menu, position)| {
+                el.child(
+                    deferred(
+                        anchored()
+                            .position(position)
+                            .anchor(Anchor::TopLeft)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(menu),
+                    )
+                    .with_priority(gpui_kit::base::POPUP_PRIORITY),
+                )
+            })
             .child(
                 StatusBar::new()
                     .h_7()

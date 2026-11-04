@@ -310,6 +310,55 @@ pub fn open(s: &mut Snapshot, mut r: Value) {
     }
     s.session["activeId"] = rid;
 }
+/// 标签关闭范围，以右键操作的标签和当前排列顺序为准。
+#[derive(Clone, Copy)]
+pub enum TabCloseScope {
+    /// 仅关闭目标标签。
+    Current,
+    /// 关闭目标之外的所有标签。
+    Others,
+    /// 关闭目标左侧的标签，不包含目标。
+    Left,
+    /// 关闭目标右侧的标签，不包含目标。
+    Right,
+    /// 关闭全部标签。
+    All,
+}
+
+/// 返回关闭范围内的标签标识；目标已失效时返回空列表，避免旧菜单误操作。
+pub fn tab_close_ids(s: &Snapshot, anchor: &str, scope: TabCloseScope) -> Vec<String> {
+    let Some(index) = tabs(s).iter().position(|tab| text(tab, "id") == anchor) else {
+        return Vec::new();
+    };
+    tabs(s)
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match scope {
+            TabCloseScope::Current => *i == index,
+            TabCloseScope::Others => *i != index,
+            TabCloseScope::Left => *i < index,
+            TabCloseScope::Right => *i > index,
+            TabCloseScope::All => true,
+        })
+        .map(|(_, tab)| text(tab, "id"))
+        .collect()
+}
+
+/// 复制目标的当前草稿及面板选择，在其右侧激活未保存副本；不复制运行资源或修改已保存请求。
+pub fn duplicate_tab(s: &mut Snapshot, source: &str) -> Option<String> {
+    let tabs = s.session.get_mut("tabs")?.as_array_mut()?;
+    let index = tabs.iter().position(|tab| text(tab, "id") == source)?;
+    let mut copy = tabs[index].clone();
+    let new_id = id();
+    copy["id"] = json!(new_id);
+    copy["request"]["id"] = json!(new_id);
+    copy["request"]["name"] = json!(format!("{} 副本", text(&copy["request"], "name")));
+    copy["baseline"] = json!("");
+    tabs.insert(index + 1, copy);
+    s.session["activeId"] = json!(new_id);
+    Some(new_id)
+}
+
 /// 比较草稿序列化内容与基线，判断当前标签是否存在未保存的接口修改。
 pub fn dirty(tab: &Value) -> bool {
     text(tab, "baseline") != tab["request"].to_string()
@@ -366,16 +415,38 @@ pub fn save_request(s: &mut Snapshot, folder: &str) -> Result<(), String> {
 }
 /// 移除指定标签，必要时选中相邻标签；调用方负责先确认未保存内容并释放运行资源。
 pub fn close(s: &mut Snapshot, rid: &str) {
-    let was_active = text(&s.session, "activeId") == rid;
-    let ts = s.session["tabs"].as_array_mut().unwrap();
-    let pos = ts.iter().position(|t| text(t, "id") == rid).unwrap_or(0);
-    ts.retain(|t| text(t, "id") != rid);
-    if was_active {
-        s.session["activeId"] = ts
-            .get(pos.min(ts.len().saturating_sub(1)))
-            .map(|t| t["id"].clone())
-            .unwrap_or(json!(""));
-    }
+    close_tabs(s, &[rid.to_owned()]);
+}
+
+/// 一次移除指定标签并返回实际移除的标识；保留存活的活动标签，否则优先选中原活动标签右侧邻居。
+/// 调用方须先确认未保存修改，并为返回的每个标识释放运行资源。
+pub fn close_tabs(s: &mut Snapshot, ids: &[String]) -> Vec<String> {
+    let active = text(&s.session, "activeId");
+    let Some(tabs) = s.session.get_mut("tabs").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let removed: Vec<String> = tabs
+        .iter()
+        .map(|tab| text(tab, "id"))
+        .filter(|id| ids.contains(id))
+        .collect();
+    let next = if removed.contains(&active) {
+        let index = tabs
+            .iter()
+            .position(|tab| text(tab, "id") == active)
+            .unwrap_or(0);
+        tabs[index..]
+            .iter()
+            .chain(tabs[..index].iter().rev())
+            .map(|tab| text(tab, "id"))
+            .find(|id| !removed.contains(id))
+            .unwrap_or_default()
+    } else {
+        active
+    };
+    tabs.retain(|tab| !removed.contains(&text(tab, "id")));
+    s.session["activeId"] = json!(next);
+    removed
 }
 /// 沿父目录查找所属根集合，遍历次数受目录总数限制以避免异常关系导致无限循环。
 pub fn root(s: &Snapshot, folder: &str) -> String {
@@ -799,5 +870,154 @@ mod tests {
         assert_eq!(s.session, before);
         s.session["tabs"] = Value::Null;
         assert!(!reorder_tab(&mut s, &ids[0], &ids[1], false));
+    }
+    /// 验证右键范围基于目标及当前顺序，边缘、单标签和失效目标不会误关其他标签。
+    #[test]
+    fn tab_close_scopes_follow_anchor_and_reordered_positions() {
+        let mut s = state();
+        for _ in 0..4 {
+            new_tab(&mut s, "");
+        }
+        let ids: Vec<_> = tabs(&s).iter().map(|tab| text(tab, "id")).collect();
+        assert_eq!(
+            tab_close_ids(&s, &ids[1], TabCloseScope::Current),
+            vec![ids[1].clone()]
+        );
+        assert_eq!(tab_close_ids(&s, &ids[1], TabCloseScope::Left), ids[..1]);
+        assert_eq!(tab_close_ids(&s, &ids[1], TabCloseScope::Right), ids[2..]);
+        assert_eq!(
+            tab_close_ids(&s, &ids[1], TabCloseScope::Others),
+            vec![ids[0].clone(), ids[2].clone(), ids[3].clone()]
+        );
+        assert_eq!(tab_close_ids(&s, &ids[1], TabCloseScope::All), ids);
+        assert!(tab_close_ids(&s, &ids[0], TabCloseScope::Left).is_empty());
+        assert!(tab_close_ids(&s, &ids[3], TabCloseScope::Right).is_empty());
+        assert!(reorder_tab(&mut s, &ids[3], &ids[0], false));
+        assert_eq!(
+            tab_close_ids(&s, &ids[0], TabCloseScope::Left),
+            vec![ids[3].clone()]
+        );
+        for scope in [
+            TabCloseScope::Current,
+            TabCloseScope::Left,
+            TabCloseScope::Right,
+            TabCloseScope::Others,
+            TabCloseScope::All,
+        ] {
+            assert!(tab_close_ids(&s, "missing", scope).is_empty());
+        }
+        let others = tab_close_ids(&s, &ids[0], TabCloseScope::Others);
+        close_tabs(&mut s, &others);
+        for scope in [
+            TabCloseScope::Left,
+            TabCloseScope::Right,
+            TabCloseScope::Others,
+        ] {
+            assert!(tab_close_ids(&s, &ids[0], scope).is_empty());
+        }
+    }
+
+    /// 验证复制保留 HTTP 当前草稿并紧邻原标签，编辑副本不影响原稿和已保存接口。
+    #[test]
+    fn duplicate_tab_copies_unsaved_http_draft_independently() {
+        let mut s = state();
+        let folder = add_folder(&mut s, "测试集合".into(), None);
+        new_tab(&mut s, &folder);
+        save_request(&mut s, &folder).unwrap();
+        let source = text(active(&s).unwrap(), "id");
+        active_mut(&mut s).unwrap()["body"] = json!("未保存的请求体");
+        s.session["tabs"][0]["panel"] = json!("body");
+        let original = tabs(&s)[0].clone();
+        let saved = s.requests.clone();
+        new_tab(&mut s, "");
+        let copy = duplicate_tab(&mut s, &source).unwrap();
+        assert_ne!(copy, source);
+        assert_eq!(active_index(&s), Some(1));
+        assert_eq!(tabs(&s)[1]["id"], copy);
+        assert_eq!(tabs(&s)[1]["panel"], "body");
+        assert_eq!(active(&s).unwrap()["body"], "未保存的请求体");
+        assert_eq!(active(&s).unwrap()["name"], "未命名请求 副本");
+        assert!(dirty(&tabs(&s)[1]));
+        active_mut(&mut s).unwrap()["body"] = json!("副本修改");
+        assert_eq!(tabs(&s)[0], original);
+        assert_eq!(s.requests, saved);
+        let before = s.session.clone();
+        assert!(duplicate_tab(&mut s, "missing").is_none());
+        assert_eq!(s.session, before);
+    }
+
+    /// 验证 MQTT 副本保留连接配置、全部发布用例和当前选择，恢复会话后仍为独立草稿。
+    #[test]
+    fn duplicate_mqtt_tab_preserves_cases_and_selection_after_restore() {
+        let mut s = state();
+        new_tab(&mut s, "");
+        active_mut(&mut s).unwrap()["protocol"] = json!("mqtt");
+        let source = text(active(&s).unwrap(), "id");
+        let case = mqtt_new_case(&mut s, false).unwrap();
+        s.session["tabs"][0]["panel"] = json!("subscriptions");
+        let original = tabs(&s)[0].clone();
+        let copy = duplicate_tab(&mut s, &source).unwrap();
+        assert_eq!(active(&s).unwrap()["mqtt"], original["request"]["mqtt"]);
+        assert_eq!(tabs(&s)[1]["mqttCaseId"], case);
+        assert_eq!(tabs(&s)[1]["panel"], "subscriptions");
+        s.session = serde_json::from_str(&s.session.to_string()).unwrap();
+        normalize(&mut s);
+        assert_eq!(s.session["activeId"], copy);
+        assert!(dirty(&tabs(&s)[1]));
+        assert_eq!(tabs(&s)[0], original);
+        assert!(s.requests.is_empty());
+    }
+
+    /// 验证批量关闭保留存活标签状态、活动选择及已保存接口，重复和过期标识不产生额外删除。
+    #[test]
+    fn close_tabs_preserves_surviving_active_draft_and_saved_requests() {
+        let mut s = state();
+        let folder = add_folder(&mut s, "测试集合".into(), None);
+        for _ in 0..4 {
+            new_tab(&mut s, &folder);
+            save_request(&mut s, &folder).unwrap();
+        }
+        let ids: Vec<_> = tabs(&s).iter().map(|tab| text(tab, "id")).collect();
+        s.session["activeId"] = json!(ids[1]);
+        active_mut(&mut s).unwrap()["body"] = json!("保留的草稿");
+        let survivor = tabs(&s)[1].clone();
+        let saved = s.requests.clone();
+        assert_eq!(
+            close_tabs(
+                &mut s,
+                &[
+                    ids[0].clone(),
+                    ids[2].clone(),
+                    ids[0].clone(),
+                    "missing".into()
+                ]
+            ),
+            vec![ids[0].clone(), ids[2].clone()]
+        );
+        assert_eq!(s.session["activeId"], ids[1]);
+        assert_eq!(tabs(&s)[0], survivor);
+        assert_eq!(s.requests, saved);
+        let before = s.session.clone();
+        assert!(close_tabs(&mut s, &["missing".into()]).is_empty());
+        assert_eq!(s.session, before);
+    }
+
+    /// 验证活动标签被批量关闭后优先选择右侧，再回退左侧；全部关闭后活动标识为空。
+    #[test]
+    fn close_tabs_selects_nearest_survivor_and_handles_empty_workspace() {
+        let mut s = state();
+        for _ in 0..5 {
+            new_tab(&mut s, "");
+        }
+        let ids: Vec<_> = tabs(&s).iter().map(|tab| text(tab, "id")).collect();
+        s.session["activeId"] = json!(ids[1]);
+        close_tabs(&mut s, &ids[1..3]);
+        assert_eq!(s.session["activeId"], ids[3]);
+        close_tabs(&mut s, &ids[3..]);
+        assert_eq!(s.session["activeId"], ids[0]);
+        close_tabs(&mut s, &ids);
+        assert!(tabs(&s).is_empty());
+        assert_eq!(s.session["activeId"], "");
+        assert!(close_tabs(&mut s, &ids).is_empty());
     }
 }
