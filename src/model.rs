@@ -298,7 +298,7 @@ pub fn open(s: &mut Snapshot, mut r: Value) {
         } else {
             String::new()
         };
-        let panel = if crate::mqtt::is_mqtt(&r) {
+        let panel = if matches!(r["protocol"].as_str(), Some("mqtt" | "websocket" | "kafka")) {
             "message"
         } else {
             "params"

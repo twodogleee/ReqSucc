@@ -316,6 +316,8 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
             "properties",
             "will",
             "mqtt-settings",
+            "connection",
+            "subscriptions",
         ]
         .contains(&str_field(tab, "panel")?)
         {
@@ -913,6 +915,50 @@ mod tests {
         model::active_mut(&mut restored).unwrap()["mqtt"]["clientId"] = json!("custom-client");
         assert!(model::dirty(&model::tabs(&restored)[0]));
     }
+    /// 验证自定义及已清除快捷键经重启和迁移后保留，切换到新空间时使用其默认配置。
+    #[test]
+    fn shortcut_overrides_survive_restart_and_migration_without_leaking_to_other_workspace() {
+        use crate::shortcuts::{self, Shortcut};
+        use gpui_kit::OperatingSystem;
+
+        let (t, mut storage) = setup();
+        let mut snapshot = storage.load().unwrap().snapshot;
+        crate::model::normalize(&mut snapshot);
+        shortcuts::set(&mut snapshot.session, Shortcut::New, "cmd-shift-n");
+        shortcuts::set(&mut snapshot.session, Shortcut::Quit, "");
+        storage.save(snapshot).unwrap();
+        drop(storage);
+
+        let mut storage = StorageService::new(t.path().join("config"), t.path().join("data"));
+        let restored = storage.load().unwrap().snapshot;
+        assert_eq!(
+            shortcuts::key(&restored.session, Shortcut::New, OperatingSystem::Mac),
+            "cmd-shift-n"
+        );
+        assert_eq!(
+            shortcuts::key(&restored.session, Shortcut::Quit, OperatingSystem::Mac),
+            ""
+        );
+        let destination = t.path().join("shortcut-migration");
+        fs::create_dir(&destination).unwrap();
+        let migrated = storage.switch(&destination, "migrate").unwrap().snapshot;
+        assert_eq!(
+            migrated.session["native"]["shortcuts"],
+            restored.session["native"]["shortcuts"]
+        );
+        let other = t.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let fresh = storage.switch(&other, "create").unwrap().snapshot;
+        assert_eq!(
+            shortcuts::key(&fresh.session, Shortcut::New, OperatingSystem::Mac),
+            "cmd-n"
+        );
+        assert_eq!(
+            shortcuts::key(&fresh.session, Shortcut::Quit, OperatingSystem::Mac),
+            "cmd-q"
+        );
+    }
+
     /// 验证旧修订号和其他空间的快照不能覆盖当前数据库。
     #[test]
     fn stale_revision_and_workspace_cannot_overwrite() {

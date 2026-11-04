@@ -102,9 +102,12 @@ impl Workbench {
                 })
         });
     }
-    /// 展示 HTTP 与 MQTT 协议切换入口，其他协议仅作为禁用占位项。
+    /// 展示 HTTP、MQTT、WebSocket 与 Kafka 协议切换入口。
     pub(super) fn protocol_picker(&self, cx: &Context<Self>) -> AnyElement {
-        let current = model::active(&self.doc).map(mqtt::is_mqtt).unwrap_or(false);
+        let protocol = model::active(&self.doc)
+            .map(|r| text(r, "protocol"))
+            .unwrap_or_default();
+        let current = protocol == "mqtt";
         let entity = cx.entity().downgrade();
         let scale = self.scale();
         Button::new("request-protocol")
@@ -131,26 +134,38 @@ impl Workbench {
                 Self::populate_menu(
                     menu,
                     &[
-                        ("HTTP".into(), Action::Protocol("http".into()), !current),
+                        (
+                            "HTTP".into(),
+                            Action::Protocol("http".into()),
+                            protocol == "http",
+                        ),
                         ("MQTT · V5".into(), Action::Protocol("mqtt".into()), current),
+                        (
+                            "WebSocket".into(),
+                            Action::Protocol("websocket".into()),
+                            protocol == "websocket",
+                        ),
+                        (
+                            "Kafka".into(),
+                            Action::Protocol("kafka".into()),
+                            protocol == "kafka",
+                        ),
                     ],
                     entity.clone(),
                     scale,
                 )
-                .separator()
-                .item(PopupMenuItem::new("Kafka · 待支持").disabled(true))
-                .item(PopupMenuItem::new("WebSocket · 待支持").disabled(true))
             })
             .into_any_element()
     }
-    /// 无活动请求或连接时切换协议并保留两种配置，释放旧运行资源并重建编辑器。
+    /// 无活动请求或连接时切换协议并保留各协议配置，释放旧运行资源并重建编辑器。
     pub(super) fn change_protocol(&mut self, protocol: &str, cx: &mut Context<Self>) {
-        if !["http", "mqtt"].contains(&protocol) {
+        if !["http", "mqtt", "websocket", "kafka"].contains(&protocol) {
             return;
         }
         let id = text(&self.doc.session, "activeId");
         if self.runs.get(&id).is_some_and(|r| r.pending)
             || self.mqtt_sessions.get(&id).is_some_and(|s| s.active())
+            || self.message_sessions.get(&id).is_some_and(|s| s.active())
         {
             self.error = "请先取消请求或断开连接，再切换协议".into();
             return;
@@ -161,9 +176,15 @@ impl Workbench {
                 r["mqtt"] = json!(mqtt::Config::default());
             }
             model::normalize_mqtt_cases(r);
+            if protocol == "websocket" && !r[protocol].is_object() {
+                r[protocol] = json!(crate::websocket::Config::default());
+            }
+            if protocol == "kafka" && !r[protocol].is_object() {
+                r[protocol] = json!(crate::kafka::Config::default());
+            }
         }
         if let Some(i) = model::active_index(&self.doc) {
-            self.doc.session["tabs"][i]["panel"] = json!(if protocol == "mqtt" {
+            self.doc.session["tabs"][i]["panel"] = json!(if protocol != "http" {
                 "message"
             } else {
                 "params"
@@ -1028,8 +1049,20 @@ impl Workbench {
         if records.is_empty() {
             return panel
                 .child(
-                    div().flex_1().flex().items_center().justify_center().child(self.kit_empty(
-                        "等待 MQTT 消息", "连接后查看发布、订阅与接收记录。⌘ / Ctrl + Enter 连接或断开；重启后不会自动连接。", Glyph::RadioTower))
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.kit_empty(
+                            "等待 MQTT 消息",
+                            &self.shortcut_hint(
+                                "连接后查看发布、订阅与接收记录，重启后不会自动连接。",
+                                "连接或断开",
+                                cx,
+                            ),
+                            Glyph::RadioTower,
+                        )),
                 )
                 .into_any_element();
         }

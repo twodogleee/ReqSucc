@@ -167,20 +167,22 @@ pub fn topic_row() -> Value {
 pub fn is_mqtt(r: &Value) -> bool {
     r["protocol"] == "mqtt"
 }
-/// 生成侧栏协议标记；MQTT 返回协议名，HTTP 返回方法名。
+/// 生成侧栏协议标记；消息协议返回协议名，HTTP 返回方法名。
 pub fn badge(r: &Value) -> String {
-    if is_mqtt(r) {
-        "MQTT".into()
-    } else {
-        model::text(r, "method")
+    match r["protocol"].as_str() {
+        Some("mqtt") => "MQTT".into(),
+        Some("websocket") => "WS".into(),
+        Some("kafka") => "KAFKA".into(),
+        _ => model::text(r, "method"),
     }
 }
 /// 按协议读取请求列表展示用地址，不进行变量解析。
 pub fn address(r: &Value) -> String {
-    if is_mqtt(r) {
-        model::text(&r["mqtt"], "address")
-    } else {
-        model::text(r, "url")
+    match r["protocol"].as_str() {
+        Some("mqtt") => model::text(&r["mqtt"], "address"),
+        Some("websocket") => model::text(&r["websocket"], "address"),
+        Some("kafka") => model::text(&r["kafka"], "brokers"),
+        _ => model::text(r, "url"),
     }
 }
 /// 从请求的 mqtt 字段反序列化配置，缺省字段沿用 Config 默认值，类型无效时返回错误。
@@ -296,6 +298,8 @@ pub fn format_json_template(source: &str) -> Result<String, serde_json::Error> {
 pub fn validate_saved(r: &Value) -> Result<(), String> {
     match r.get("protocol").and_then(Value::as_str).unwrap_or("http") {
         "http" => {}
+        "websocket" => crate::websocket::validate_saved(&r["websocket"])?,
+        "kafka" => crate::kafka::validate_saved(&r["kafka"])?,
         "mqtt" => {
             config(r)?;
             // 旧版请求没有 publishCases，加载时由模型层补齐，持久化校验仍允许该格式。

@@ -6,9 +6,15 @@
 mod controls;
 use crate::theme::{TextRole, TypographyExt};
 use controls::*;
+/// WebSocket 与 Kafka 的配置、操作和消息界面。
+mod messaging_view;
 /// MQTT 协议切换、连接配置、发布用例和消息详情界面。
 mod mqtt_view;
+use crate::{kafka, messaging, websocket};
+/// 应用快捷键设置页与按键录入交互。
+mod shortcuts_view;
 use crate::mqtt;
+use crate::shortcuts::{self, Shortcut};
 use crate::{
     backend::{self, Backend, Event},
     http,
@@ -135,10 +141,16 @@ enum Action {
     Panel(String),
     /// 切换工作台主页面，参数为页面标识。
     Screen(String),
-    /// 切换当前协议的运行状态：发送或取消 HTTP，连接或断开 MQTT。
+    /// 切换当前协议的运行状态：发送或取消 HTTP，连接或断开消息协议。
     Send,
-    /// 切换活动请求协议，参数仅允许 http 或 mqtt。
+    /// 切换活动请求协议，参数允许 http、mqtt、websocket 或 kafka。
     Protocol(String),
+    /// 提交消息协议操作，参数为操作名称。
+    MessageOp(String),
+    /// 展示指定记录的详情。
+    MessageRecord(u64),
+    /// 确认删除指定 Kafka 主题，绑定标签和会话避免误操作。
+    MessageDelete(String),
     /// 提交当前选中的 MQTT 发布用例。
     MqttPublish,
     /// 调整订阅行，参数依次为下标和启用标记；false 表示取消订阅。
@@ -215,6 +227,18 @@ enum Action {
     Theme(bool),
     /// 切换设置分类，参数为分类标识。
     SettingsPage(String),
+    /// 开始录入指定应用操作的组合键。
+    RecordShortcut(Shortcut),
+    /// 清除单项快捷键，保留按钮和菜单入口。
+    ClearShortcut(Shortcut),
+    /// 取消当前组合键录入，不改变原绑定。
+    CancelShortcut,
+    /// 结束录入并请求确认清除全部应用快捷键。
+    ConfirmClearShortcuts,
+    /// 清除所有应用操作快捷键，保留标准编辑快捷键。
+    ClearShortcuts,
+    /// 恢复所有应用操作的默认快捷键。
+    ResetShortcuts,
     /// 恢复默认主题、缩放、字号和编辑器显示偏好。
     ResetDisplay,
     /// 按 create、open 或 migrate 模式选择目录并提交预检。
@@ -279,11 +303,11 @@ pub struct Workbench {
     selects: HashMap<String, SelectSlot>,
     /// 输入和编辑器事件订阅的所有权集合，重建字段时统一释放。
     subscriptions: Vec<Subscription>,
-    /// 当前请求正文或 MQTT 消息使用的编辑器状态。
+    /// 当前请求正文或消息协议使用的编辑器状态。
     body: Option<Entity<EditorState>>,
     /// 正文编辑器对应的绑定和格式标识，变化时重建编辑器。
     body_key: String,
-    /// 当前 HTTP 响应或 MQTT 详情的只读编辑器状态。
+    /// 当前 HTTP 响应或消息详情的只读编辑器状态。
     response_editor: Option<Entity<EditorState>>,
     /// 响应编辑器内容身份，用于分区或结果变化后的重建。
     response_key: String,
@@ -291,6 +315,12 @@ pub struct Workbench {
     runs: HashMap<String, RunState>,
     /// 请求标签标识到临时 MQTT 会话的映射，移除会话会取消连接。
     mqtt_sessions: HashMap<String, mqtt::Session>,
+    /// WebSocket 与 Kafka 标签独占的临时会话。
+    message_sessions: HashMap<String, messaging::Session>,
+    /// 各消息会话最后展示的修订号。
+    message_revisions: HashMap<String, u64>,
+    /// 各消息标签选择的详情记录标识。
+    message_selected: HashMap<String, u64>,
     /// 各 MQTT 会话上次观察到的修订号，用于按变化刷新界面。
     mqtt_revisions: HashMap<String, u64>,
     /// 各请求标签选中的 MQTT 记录标识，记录失效时回退到最新项。
@@ -319,6 +349,14 @@ pub struct Workbench {
     tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>)>,
     /// 当前右键菜单的关闭事件订阅，独立于编辑器订阅以免切换标签时丢失。
     tab_menu_subscription: Option<Subscription>,
+    /// 组件初始化后的标准绑定快照，重建应用快捷键时完整保留。
+    standard_shortcuts: Vec<KeyBinding>,
+    /// 当前等待录入组合键的应用操作；离开设置或取消时清空。
+    shortcut_recording: Option<Shortcut>,
+    /// 录入期间拦截按键的订阅，避免待设置组合键触发原操作。
+    shortcut_capture: Option<Subscription>,
+    /// 快捷键冲突或配置加载失败时的设置页提示。
+    shortcut_error: String,
     /// 最近已自动滚入视野的活动标签标识，避免每次渲染都重置滚动。
     visible_tab: String,
 }
@@ -370,7 +408,7 @@ impl Workbench {
         bind!(Settings, |_: &mut Self| Action::Screen("settings".into()));
         bind!(Quit, |_: &mut Self| Action::Quit);
     }
-    /// 构造统一尺寸、提示和无障碍标签的图标按钮，并按动作检查 MQTT 编辑锁。
+    /// 构造统一尺寸、提示和无障碍标签的图标按钮，并按动作检查连接配置编辑锁。
     fn icon_button(
         &self,
         id: impl Into<ElementId>,
@@ -396,7 +434,7 @@ impl Workbench {
             .disabled(self.locked_action(&action))
             .on_click(cx.listener(move |this, _, w, cx| this.act(action.clone(), w, cx)))
     }
-    /// 按深浅主题返回 HTTP 方法或 MQTT 协议标记颜色。
+    /// 按深浅主题返回 HTTP 方法或消息协议标记颜色。
     fn method_color(&self, method: &str) -> Hsla {
         if self.doc.session["native"]["light"]
             .as_bool()
@@ -407,6 +445,8 @@ impl Workbench {
                 "POST" => 0x805c1b,
                 "PUT" => 0x315cb4,
                 "PATCH" | "MQTT" => 0x724ca0,
+                "WS" => 0x246ba4,
+                "KAFKA" => 0x956208,
                 "DELETE" => 0xb13640,
                 _ => 0x526274,
             })
@@ -417,6 +457,8 @@ impl Workbench {
             "POST" => 0xe2bd73,
             "PUT" => 0x8aacf2,
             "PATCH" | "MQTT" => 0xb99ae9,
+            "WS" => 0x80bcf4,
+            "KAFKA" => 0xe6b75c,
             "DELETE" => 0xee9296,
             _ => 0xaeb5bc,
         })
@@ -440,6 +482,8 @@ impl Workbench {
             session: json!({}),
         };
         model::normalize(&mut doc);
+        let standard_shortcuts: Vec<_> = cx.key_bindings().borrow().bindings().cloned().collect();
+        let shortcut_error = shortcuts::apply(&doc.session, &standard_shortcuts, cx).join("\n");
         let task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -457,6 +501,7 @@ impl Workbench {
             }
             this.http.clear();
             this.mqtt_sessions.clear();
+            this.message_sessions.clear();
             async {}
         })
         .detach();
@@ -490,6 +535,9 @@ impl Workbench {
             response_key: String::new(),
             runs: HashMap::new(),
             mqtt_sessions: HashMap::new(),
+            message_sessions: HashMap::new(),
+            message_revisions: HashMap::new(),
+            message_selected: HashMap::new(),
             mqtt_revisions: HashMap::new(),
             mqtt_selected: HashMap::new(),
             settings_page: "display".into(),
@@ -503,6 +551,10 @@ impl Workbench {
             tab_scroll: ScrollHandle::new(),
             tab_menu: None,
             tab_menu_subscription: None,
+            standard_shortcuts,
+            shortcut_recording: None,
+            shortcut_capture: None,
+            shortcut_error,
             visible_tab: String::new(),
             focus: {
                 let focus = cx.focus_handle();
@@ -545,7 +597,7 @@ impl Workbench {
         self.status = "正在保存草稿…".into();
         cx.notify();
     }
-    /// 处理后台回执和自动保存防抖，按运行标识丢弃旧响应，并观察 MQTT 修订号触发刷新。
+    /// 处理后台回执和自动保存防抖，按运行标识丢弃旧响应，并观察消息会话修订号触发刷新。
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut notify = false;
         while let Ok(event) = self.rx.try_recv() {
@@ -583,9 +635,13 @@ impl Workbench {
                             self.http.clear();
                             self.runs.clear();
                             self.mqtt_sessions.clear();
+                            self.message_sessions.clear();
+                            self.message_revisions.clear();
+                            self.message_selected.clear();
                             self.mqtt_selected.clear();
                             self.mqtt_revisions.clear();
                             self.reset_fields();
+                            self.refresh_shortcuts(cx);
                             let light = self.doc.session["native"]["light"]
                                 .as_bool()
                                 .unwrap_or(false);
@@ -656,6 +712,12 @@ impl Workbench {
                 notify = true;
             }
         }
+        for (id, session) in &self.message_sessions {
+            let rev = messaging::with(&session.live, |live| live.revision);
+            if self.message_revisions.insert(id.clone(), rev) != Some(rev) {
+                notify = true;
+            }
+        }
         if notify {
             cx.notify();
         }
@@ -693,15 +755,18 @@ impl Workbench {
             Binding::Search => json!(self.search),
         }
     }
-    /// 判断活动 MQTT 会话是否锁定连接配置；消息发布字段仍可编辑。
+    /// 判断活动消息会话是否锁定连接配置；消息发布字段仍可编辑。
     fn mqtt_binding_locked(&self, b: &Binding) -> bool {
+        if self.message_binding_locked(b) {
+            return true;
+        }
         matches!(b, Binding::Request(p) if p.starts_with("/mqtt/") && !["/mqtt/topic", "/mqtt/payload", "/mqtt/format", "/mqtt/qos", "/mqtt/retain", "/mqtt/contentType", "/mqtt/responseTopic", "/mqtt/expiry"].contains(&p.as_str()))
             && self
                 .mqtt_sessions
                 .get(&text(&self.doc.session, "activeId"))
                 .is_some_and(|s| s.active())
     }
-    /// 检查字段写入和列表增删动作是否受到 MQTT 连接期间的编辑锁限制。
+    /// 检查字段写入和列表增删动作是否受到连接期间的编辑锁限制。
     fn locked_action(&self, action: &Action) -> bool {
         match action {
             Action::Set(b, _) | Action::AddRow(b) | Action::RemoveRow(b, _) => {
@@ -718,6 +783,11 @@ impl Workbench {
             return;
         }
         if !self.ready || self.busy {
+            return;
+        }
+        if self.message_binding_locked(b) {
+            self.error = "请先断开连接，再修改连接配置".into();
+            cx.notify();
             return;
         }
         let assign = |root: &mut Value, p: &str, v: Value| {
@@ -824,7 +894,18 @@ impl Workbench {
                 move |this, state, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         let text = state.read(cx).value().to_string();
-                        let value = if numeric {
+                        let value = if numeric
+                            && matches!(&b, Binding::Request(path) if path == "/kafka/partition")
+                        {
+                            match text.parse::<i32>() {
+                                Ok(n) if n >= -1 => json!(n),
+                                _ => {
+                                    this.error = "发布分区须为 -1（自动）或非负整数".into();
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        } else if numeric {
                             match text.parse::<u64>() {
                                 Ok(n) => json!(n),
                                 Err(_) => {
@@ -1090,7 +1171,16 @@ impl Workbench {
         if self.busy && !matches!(a, Action::Quit) {
             return;
         }
+        self.shortcut_recording = None;
+        self.shortcut_capture = None;
         match a {
+            Action::MessageOp(op) => self.message_operation(&op, cx),
+            Action::MessageRecord(record) => {
+                self.message_selected
+                    .insert(text(&self.doc.session, "activeId"), record);
+                self.response_key.clear();
+            }
+            Action::MessageDelete(topic) => self.message_delete_dialog(topic, window, cx),
             Action::SearchFocus => {
                 self.screen = "requests".into();
                 self.doc.session["native"]["sidebarClosed"] = json!(false);
@@ -1535,6 +1625,37 @@ impl Workbench {
                 self.settings_page = page;
                 self.reset_fields();
             }
+            Action::RecordShortcut(shortcut) => self.record_shortcut(shortcut, window, cx),
+            Action::CancelShortcut => self.shortcut_error.clear(),
+            Action::ClearShortcut(shortcut) => {
+                shortcuts::set(&mut self.doc.session, shortcut, "");
+                self.refresh_shortcuts(cx);
+                self.changed(cx);
+            }
+            Action::ConfirmClearShortcuts => {
+                if !window.has_active_dialog(cx) {
+                    self.confirm(
+                        "清除全部快捷键",
+                        "清除所有应用操作快捷键，保留标准编辑快捷键。之后可通过本页恢复默认。"
+                            .into(),
+                        Action::ClearShortcuts,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Action::ClearShortcuts => {
+                for shortcut in shortcuts::ALL {
+                    shortcuts::set(&mut self.doc.session, shortcut, "");
+                }
+                self.refresh_shortcuts(cx);
+                self.changed(cx);
+            }
+            Action::ResetShortcuts => {
+                self.doc.session["native"]["shortcuts"] = json!({});
+                self.refresh_shortcuts(cx);
+                self.changed(cx);
+            }
             Action::ResetDisplay => {
                 for (key, value) in [
                     ("light", json!(false)),
@@ -1555,8 +1676,9 @@ impl Workbench {
             Action::SwitchStorage => {
                 if self.runs.values().any(|r| r.pending)
                     || self.mqtt_sessions.values().any(|s| s.active())
+                    || self.message_sessions.values().any(|s| s.active())
                 {
-                    self.error = "请先取消正在发送的请求，并断开 MQTT 连接".into();
+                    self.error = "请先取消正在发送的请求，并断开所有协议连接".into();
                 } else if (!self.ready || self.flush(cx)) && self.plan.is_some() {
                     let (mode, plan) = self.plan.take().unwrap();
                     self.busy = true;
@@ -1577,6 +1699,9 @@ impl Workbench {
                 if self.flush(cx) {
                     self.http.clear();
                     self.mqtt_sessions.clear();
+                    self.message_sessions.clear();
+                    self.message_revisions.clear();
+                    self.message_selected.clear();
                     cx.quit();
                 }
             }
@@ -1675,8 +1800,11 @@ impl Workbench {
         self.reset_fields();
         self.changed(cx);
     }
-    /// 释放指定标签的 MQTT 会话、详情选择和 HTTP 运行及缓存，HTTP 在途任务同时收到取消信号。
+    /// 释放指定标签的消息会话、详情选择和 HTTP 运行及缓存，在途任务同时收到取消信号。
     fn release(&mut self, id: &str) {
+        self.message_sessions.remove(id);
+        self.message_revisions.remove(id);
+        self.message_selected.remove(id);
         self.mqtt_sessions.remove(id);
         self.mqtt_selected.remove(id);
         self.mqtt_revisions.remove(id);
@@ -1685,8 +1813,12 @@ impl Workbench {
             self.http.release(&run.id);
         }
     }
-    /// 按当前协议发送或取消 HTTP、连接或断开 MQTT；HTTP 结果携带标签和运行标识异步回传。
+    /// 按当前协议发送或取消 HTTP、连接或断开消息协议；HTTP 结果携带标签和运行标识异步回传。
     fn send(&mut self, cx: &mut Context<Self>) {
+        if self.is_messaging() {
+            self.message_connect(cx);
+            return;
+        }
         if model::active(&self.doc).is_some_and(mqtt::is_mqtt) {
             self.mqtt_connect(cx);
             return;
@@ -1822,11 +1954,13 @@ impl Workbench {
         })
         .detach();
     }
-    /// 无活动 HTTP 或 MQTT 任务时打开目录选择器，将目标及模式交给后台预检。
+    /// 无活动请求或消息连接时打开目录选择器，将目标及模式交给后台预检。
     fn choose_storage(&mut self, mode: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.runs.values().any(|r| r.pending) || self.mqtt_sessions.values().any(|s| s.active())
+        if self.runs.values().any(|r| r.pending)
+            || self.mqtt_sessions.values().any(|s| s.active())
+            || self.message_sessions.values().any(|s| s.active())
         {
-            self.error = "请先完成或取消 HTTP 请求，并断开 MQTT 连接".into();
+            self.error = "请先完成或取消 HTTP 请求，并断开所有协议连接".into();
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -2215,8 +2349,11 @@ impl Workbench {
         }
         panel.into_any_element()
     }
-    /// 绘制活动请求的名称、协议、方法、地址和编辑分区；MQTT 请求交给专用视图。
+    /// 绘制活动请求的名称、协议、方法、地址和编辑分区；消息协议交给专用视图。
     fn request_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.is_messaging() {
+            return self.message_request(window, cx);
+        }
         let Some(r) = model::active(&self.doc).cloned() else {
             return div()
                 .size_full()
@@ -2441,6 +2578,9 @@ impl Workbench {
     }
     /// 绘制 HTTP 等待、失败或响应结果，提供分区切换、正文预览、复制和导出。
     fn response_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.is_messaging() {
+            return self.message_records(window, cx);
+        }
         if model::active(&self.doc).is_some_and(mqtt::is_mqtt) {
             return self.mqtt_messages(window, cx);
         }
@@ -2507,10 +2647,14 @@ impl Workbench {
                         .items_center()
                         .justify_center()
                         .child(self.kit_empty(
-                        "等待响应",
-                        "发送请求后，在这里查看服务器返回的内容。⌘ / Ctrl + Enter 发送当前请求。",
-                        Glyph::Send,
-                    )),
+                            "等待响应",
+                            &self.shortcut_hint(
+                                "发送请求后，在这里查看服务器返回的内容。",
+                                "发送或取消当前请求",
+                                cx,
+                            ),
+                            Glyph::Send,
+                        )),
                 )
                 .into_any_element();
         }
@@ -2852,6 +2996,19 @@ impl Workbench {
                     .child(self.help(description, cx)),
             )
     }
+    /// 创建关于页的可聚焦链接按钮，使用系统默认浏览器打开固定的公开地址。
+    fn about_link(&self, id: &'static str, label: &'static str, url: &'static str) -> Button {
+        Button::new(id)
+            .link()
+            .small()
+            .px_0()
+            .h(self.scaled(crate::theme::CONTROL_HEIGHT))
+            .typography(TextRole::Body)
+            .label(label)
+            .tooltip(url)
+            .on_click(move |_, _, cx| cx.open_url(url))
+    }
+
     /// 绘制设置说明与控件；compact 为 true 时纵向排列，适应高缩放或窄窗口。
     fn setting_row(
         &self,
@@ -2912,12 +3069,13 @@ impl Workbench {
                 );
             }))
     }
-    /// 绘制显示、存储、请求及关于设置页，按可用内容宽度调整布局并展示目录操作计划。
+    /// 绘制显示、快捷键、存储、请求及关于设置页，按可用内容宽度调整布局并展示目录操作计划。
     fn settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let page = self.settings_page.clone();
         let mut menu = SidebarMenu::new();
         for (id, name, icon) in [
             ("display", "显示设置", IconName::Settings2),
+            ("shortcuts", "快捷键", IconName::Settings2),
             ("storage", "数据存储", IconName::HardDrive),
             ("network", "请求设置", IconName::Globe),
             ("about", "关于 ReqSucc", IconName::Info),
@@ -2936,6 +3094,7 @@ impl Workbench {
             .header(SidebarHeader::new().child(self.section_title("偏好设置", cx)))
             .child(SidebarGroup::new("通用").child(menu));
         let heading = match page.as_str() {
+            "shortcuts" => "快捷键",
             "storage" => "数据存储",
             "network" => "请求设置",
             "about" => "关于 ReqSucc",
@@ -2968,7 +3127,9 @@ impl Workbench {
                     .gap_1()
                     .pb_1()
                     .child(self.page_title(heading, cx))
-                    .child(self.help("修改后自动保存，下次打开继续使用。", cx)),
+                    .when(page != "about", |el| {
+                        el.child(self.help("修改后自动保存，下次打开继续使用。", cx))
+                    }),
             );
         match page.as_str() {
             "storage" => {
@@ -3087,6 +3248,9 @@ impl Workbench {
                     );
                 }
             }
+            "shortcuts" => {
+                content = content.child(self.shortcuts_settings(compact, cx));
+            }
             "network" => {
                 let options = self.options(true, window, cx);
                 content = content.child(
@@ -3099,32 +3263,71 @@ impl Workbench {
                 );
             }
             "about" => {
-                content =
-                    content.child(
-                        self.setting_card("ReqSucc 0.4.0", "全中文本地接口工作台", cx)
-                            .child(
-                                v_flex()
-                                    .p_3()
-                                    .gap_4()
-                                    .child(
-                                        h_flex()
-                                            .flex_wrap()
-                                            .gap_2()
-                                            .child(
-                                                svg()
-                                                    .path("brand/flying-cat.svg")
-                                                    .size(self.scaled(48.))
-                                                    .text_color(cx.theme().foreground),
-                                            )
-                                            .child("请求成功，调试从容。"),
-                                    )
-                                    .child(self.help(
-                                        "数据保存在本机，支持手动 HTTP 与 MQTT V5 调试。",
-                                        cx,
-                                    ))
-                                    .child(self.help("当前不提供脚本、断言测试或云同步。", cx)),
-                            ),
-                    );
+                content = content.child(
+                    self.setting_card("ReqSucc 0.4.0", "全中文本地接口工作台", cx)
+                        .child(
+                            v_flex()
+                                .p_3()
+                                .gap_4()
+                                .child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(
+                                            svg()
+                                                .path("brand/flying-cat.svg")
+                                                .size(self.scaled(48.))
+                                                .text_color(cx.theme().foreground),
+                                        )
+                                        .child("请求成功，调试从容。"),
+                                )
+                                .child(self.help(
+                                    "数据保存在本机，支持 HTTP、MQTT V5、WebSocket 与 Kafka 调试。",
+                                    cx,
+                                ))
+                                .child(self.help("当前不提供脚本、断言测试或云同步。", cx))
+                                .child(
+                                    v_flex()
+                                        .gap_3()
+                                        .pt_4()
+                                        .border_t_1()
+                                        .border_color(cx.theme().border)
+                                        .child(
+                                            h_flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .child(self.help("作者：", cx))
+                                                .child(self.copy("Andersen", TextRole::Body, cx)),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .child(self.help("作者网站：", cx))
+                                                .child(self.about_link(
+                                                    "about-author-website",
+                                                    "36knight.com",
+                                                    "https://36knight.com",
+                                                )),
+                                        )
+                                        .child(self.help(
+                                            "ReqSucc 是开源项目，采用 Apache License 2.0 协议。",
+                                            cx,
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .child(self.help("源码地址：", cx))
+                                                .child(self.about_link(
+                                                    "about-source-repository",
+                                                    "github.com/twodogleee/ReqSucc",
+                                                    "https://github.com/twodogleee/ReqSucc",
+                                                )),
+                                        ),
+                                ),
+                        ),
+                );
             }
             _ => {
                 let light = self.doc.session["native"]["light"]
@@ -3674,7 +3877,13 @@ impl Render for Workbench {
                                         .typography(TextRole::Control)
                                         .child("搜索接口"),
                                 )
-                                .child(div().typography(TextRole::Caption).child("⌘ K")),
+                                .child(div().typography(TextRole::Caption).child(
+                                    shortcuts::display(
+                                        &self.doc.session,
+                                        Shortcut::Search,
+                                        cx.platform_info().os,
+                                    ),
+                                )),
                         )
                         .on_click(
                             cx.listener(|this, _, w, cx| this.act(Action::SearchFocus, w, cx)),
@@ -3960,9 +4169,13 @@ impl Render for Workbench {
                 .into_any_element()
         };
         let error = self.error.clone();
-        let show_retry = error != MQTT_FORMAT_ERROR && !error.starts_with("发布用例");
+        let show_retry = matches!(
+            self.status.as_str(),
+            "保存失败 · 请重试" | "数据目录未能打开"
+        );
         v_flex()
             .id("reqsucc-workbench")
+            .relative()
             .track_focus(&self.focus)
             .size_full()
             .bg(cx.theme().background)
@@ -3976,27 +4189,6 @@ impl Render for Workbench {
                     .border_color(cx.theme().border)
                     .child(top),
             )
-            .when(!error.is_empty(), |el| {
-                el.child(
-                    h_flex()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .child(
-                            Alert::error("workbench-error", error)
-                                .small()
-                                .banner()
-                                .flex_1()
-                                .on_close(cx.listener(|this, _, _, cx| {
-                                    this.error.clear();
-                                    cx.notify();
-                                })),
-                        )
-                        .when(show_retry, |el| {
-                            el.child(self.button("retry", "重试保存 / 打开", Action::Retry, cx))
-                        }),
-                )
-            })
             .child(
                 h_flex()
                     .flex_1()
@@ -4004,6 +4196,67 @@ impl Render for Workbench {
                     .child(rail)
                     .child(div().flex_1().min_w_0().h_full().child(work)),
             )
+            .when(!error.is_empty(), |el| {
+                // 错误浮层脱离主布局，不改变分栏尺寸或触发尺寸持久化；层级低于菜单和确认弹窗。
+                el.child(
+                    deferred(
+                        v_flex()
+                            .id("workbench-error-overlay")
+                            .absolute()
+                            .top(self.scaled(50.))
+                            .right(self.scaled(12.))
+                            .w(self.scaled(520.))
+                            .max_w(relative(0.9))
+                            .max_h(self.scaled(240.))
+                            .overflow_y_scroll()
+                            .occlude()
+                            .bg(cx.theme().background)
+                            .border_1()
+                            .border_color(cx.theme().danger)
+                            .rounded(self.scaled(8.))
+                            .shadow_lg()
+                            .child(
+                                h_flex()
+                                    .items_start()
+                                    .child(
+                                        Alert::error("workbench-error", error)
+                                            .small()
+                                            .banner()
+                                            .flex_1()
+                                            .min_w_0(),
+                                    )
+                                    .child(
+                                        Button::new("dismiss-workbench-error")
+                                            .ghost()
+                                            .small()
+                                            .m_1()
+                                            .w(self.scaled(28.))
+                                            .h(self.scaled(28.))
+                                            .icon(
+                                                Icon::new(IconName::Close)
+                                                    .size(self.scaled(16.))
+                                                    .text_color(cx.theme().danger),
+                                            )
+                                            .accessibility_label("关闭错误提示")
+                                            .tooltip("关闭错误提示")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.error.clear();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .when(show_retry, |el| {
+                                el.child(h_flex().justify_end().px_2().pb_2().child(self.button(
+                                    "retry",
+                                    "重试保存 / 打开",
+                                    Action::Retry,
+                                    cx,
+                                )))
+                            }),
+                    )
+                    .with_priority(gpui_kit::base::POPUP_PRIORITY - 1),
+                )
+            })
             .when_some(self.tab_menu.clone(), |el, (menu, position)| {
                 el.child(
                     deferred(

@@ -30,6 +30,9 @@ encoding_rs = "0.8"
 url = "2"
 dirs = "6"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+rdkafka = { version = "=0.39.0", features = ["ssl-vendored", "libz-static"] }
 
 [profile.dev]
 debug = 0
