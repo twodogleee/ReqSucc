@@ -521,10 +521,13 @@ impl Workspace {
                 "当前数据目录已变更或磁盘已断开，请恢复原目录后重试；内存编辑仍保留".into(),
             );
         }
-        if fs::metadata(&self.path)
-            .map_err(io)?
-            .permissions()
-            .readonly()
+        // Windows 的目录只读属性用于资源管理器外观，不代表 ACL 写权限；实际写入仍由系统校验。
+        let directory_readonly = !cfg!(windows)
+            && fs::metadata(&self.path)
+                .map_err(io)?
+                .permissions()
+                .readonly();
+        if directory_readonly
             || fs::metadata(self.path.join(DB))
                 .map_err(io)?
                 .permissions()
@@ -915,7 +918,7 @@ mod tests {
         model::active_mut(&mut restored).unwrap()["mqtt"]["clientId"] = json!("custom-client");
         assert!(model::dirty(&model::tabs(&restored)[0]));
     }
-    /// 验证自定义及已清除快捷键经重启和迁移后保留，切换到新空间时使用其默认配置。
+    /// 验证两个平台的自定义及已清除快捷键经重启和迁移后独立保留，新空间使用默认值。
     #[test]
     fn shortcut_overrides_survive_restart_and_migration_without_leaking_to_other_workspace() {
         use crate::shortcuts::{self, Shortcut};
@@ -924,8 +927,24 @@ mod tests {
         let (t, mut storage) = setup();
         let mut snapshot = storage.load().unwrap().snapshot;
         crate::model::normalize(&mut snapshot);
-        shortcuts::set(&mut snapshot.session, Shortcut::New, "cmd-shift-n");
-        shortcuts::set(&mut snapshot.session, Shortcut::Quit, "");
+        shortcuts::set(
+            &mut snapshot.session,
+            Shortcut::New,
+            "cmd-shift-n",
+            OperatingSystem::Mac,
+        );
+        shortcuts::set(
+            &mut snapshot.session,
+            Shortcut::Quit,
+            "",
+            OperatingSystem::Mac,
+        );
+        shortcuts::set(
+            &mut snapshot.session,
+            Shortcut::New,
+            "ctrl-shift-n",
+            OperatingSystem::Windows,
+        );
         storage.save(snapshot).unwrap();
         drop(storage);
 
@@ -939,12 +958,20 @@ mod tests {
             shortcuts::key(&restored.session, Shortcut::Quit, OperatingSystem::Mac),
             ""
         );
+        assert_eq!(
+            shortcuts::key(&restored.session, Shortcut::New, OperatingSystem::Windows),
+            "ctrl-shift-n"
+        );
+        assert_eq!(
+            shortcuts::key(&restored.session, Shortcut::Quit, OperatingSystem::Windows),
+            "ctrl-q"
+        );
         let destination = t.path().join("shortcut-migration");
         fs::create_dir(&destination).unwrap();
         let migrated = storage.switch(&destination, "migrate").unwrap().snapshot;
         assert_eq!(
-            migrated.session["native"]["shortcuts"],
-            restored.session["native"]["shortcuts"]
+            migrated.session["native"]["shortcutsByPlatform"],
+            restored.session["native"]["shortcutsByPlatform"]
         );
         let other = t.path().join("other");
         fs::create_dir(&other).unwrap();
@@ -956,6 +983,10 @@ mod tests {
         assert_eq!(
             shortcuts::key(&fresh.session, Shortcut::Quit, OperatingSystem::Mac),
             "cmd-q"
+        );
+        assert_eq!(
+            shortcuts::key(&fresh.session, Shortcut::New, OperatingSystem::Windows),
+            "ctrl-n"
         );
     }
 
@@ -1109,10 +1140,25 @@ mod tests {
         let (t, mut s) = setup();
         let mut x = s.load().unwrap().snapshot;
         x.requests.push(req());
+        #[cfg(not(windows))]
         fs::rename(t.path().join("data"), t.path().join("unplugged")).unwrap();
+        // Windows 不允许移动仍被 SQLite 打开的目录，用不可达路径模拟同一失联边界。
+        #[cfg(windows)]
+        let original_path = {
+            let active = s.active.as_mut().unwrap();
+            std::mem::replace(&mut active.path, t.path().join("unplugged"))
+        };
         assert!(s.save(x.clone()).is_err());
+        #[cfg(not(windows))]
         assert!(!t.path().join("data").exists());
+        #[cfg(windows)]
+        assert!(!t.path().join("unplugged").exists());
+        #[cfg(not(windows))]
         fs::rename(t.path().join("unplugged"), t.path().join("data")).unwrap();
+        #[cfg(windows)]
+        {
+            s.active.as_mut().unwrap().path = original_path;
+        }
         s.save(x).unwrap();
         assert_eq!(s.load().unwrap().snapshot.requests.len(), 1);
     }
@@ -1129,18 +1175,33 @@ mod tests {
         assert_eq!(s.load().unwrap().snapshot.requests[0]["headers"], json!([]));
     }
     /// 验证只读数据库保存返回失败，不报告虚假成功。
-    #[cfg(unix)]
     #[test]
     fn readonly_database_does_not_report_success() {
-        use std::os::unix::fs::PermissionsExt;
         let (t, mut s) = setup();
         let x = s.load().unwrap().snapshot;
         let db = t.path().join("data").join(DB);
         let original = fs::metadata(&db).unwrap().permissions();
-        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&db, readonly).unwrap();
         assert!(s.save(x.clone()).is_err());
         fs::set_permissions(db, original).unwrap();
         s.save(x).unwrap();
+    }
+    /// Windows 目录的只读外观属性不能阻止正常保存，数据库文件权限仍独立校验。
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_readonly_attribute_allows_save() {
+        let (t, mut s) = setup();
+        let x = s.load().unwrap().snapshot;
+        let directory = t.path().join("data");
+        let original = fs::metadata(&directory).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&directory, readonly).unwrap();
+        let result = s.save(x);
+        fs::set_permissions(directory, original).unwrap();
+        assert!(result.is_ok());
     }
     /// 验证第一版模式升级保留草稿，并生成可独立重新打开的旧版备份。
     #[test]

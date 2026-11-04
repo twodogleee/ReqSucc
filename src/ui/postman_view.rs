@@ -81,10 +81,7 @@ impl Workbench {
         let mut content = v_flex()
             .p_3()
             .gap_3()
-            .child(self.help(
-                "从本地 JSON 导入 Collection v2.0 / v2.1 或环境，可同时选择多个文件。",
-                cx,
-            ))
+            .child(self.help("支持 Postman 集合 v2.0 / v2.1 和环境 JSON，可多选。", cx))
             .child(
                 h_flex().child(
                     self.button(
@@ -97,14 +94,12 @@ impl Workbench {
                         Action::ChoosePostman,
                         cx,
                     )
-                    .icon(
-                        Icon::new(IconName::FolderOpen).size(self.scaled(crate::theme::ICON_SIZE)),
-                    )
+                    .icon(Icon::new(Glyph::FileInput).size(self.scaled(crate::theme::ICON_SIZE)))
                     .disabled(!self.ready || self.busy || self.postman_loading),
                 ),
             )
             .child(self.help(
-                "以新增方式导入，同名集合和环境自动重命名。不会覆盖现有接口或切换当前环境。",
+                "导入为新数据，同名项自动重命名；现有接口和当前环境不变。",
                 cx,
             ));
         if let Some((_, plan)) = &self.postman_plan {
@@ -112,7 +107,7 @@ impl Workbench {
                 .child(self.section_title("导入预览", cx))
                 .child(self.help(&plan.summary(), cx))
                 .child(self.help(
-                    "集合与目录的继承认证按有效值写入每条接口。变量占位符保留，导入不会发送请求。",
+                    "保留变量占位符，并应用继承的认证配置。导入不会发送请求。",
                     cx,
                 ));
             for warning in &plan.warnings {

@@ -1,0 +1,35 @@
+// Windows 可执行文件资源；版本宏由 build.rs 从 Cargo.toml 注入。
+// 作者：Andersen
+#include <windows.h>
+
+1 ICON "assets/ReqSucc.ico"
+1 RT_MANIFEST "assets/windows/app.manifest"
+
+1 VERSIONINFO
+FILEVERSION APP_VERSION_NUM
+PRODUCTVERSION APP_VERSION_NUM
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Andersen\0"
+            VALUE "FileDescription", "ReqSucc\0"
+            VALUE "FileVersion", APP_VERSION "\0"
+            VALUE "InternalName", "reqsucc\0"
+            VALUE "OriginalFilename", "ReqSucc.exe\0"
+            VALUE "ProductName", "ReqSucc\0"
+            VALUE "ProductVersion", APP_VERSION "\0"
+            VALUE "LegalCopyright", "Andersen\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

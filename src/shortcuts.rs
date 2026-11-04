@@ -52,7 +52,7 @@ impl Shortcut {
     /// 返回设置页和冲突提示使用的中文名称。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Search => "搜索接口",
+            Self::Search => "查找请求",
             Self::New => "新建请求",
             Self::Save => "保存接口",
             Self::Send => "发送 / 取消 / 连接",
@@ -96,10 +96,35 @@ impl Shortcut {
     }
 }
 
-/// 读取当前绑定；缺失或非字符串值继承默认，空字符串表示用户明确清除绑定。
+/// 返回平台配置分组；不把 macOS 的 Command 组合键解释成 Windows 徽标键。
+fn platform_key(os: OperatingSystem) -> &'static str {
+    match os {
+        OperatingSystem::Mac => "macos",
+        OperatingSystem::Windows => "windows",
+        _ => "other",
+    }
+}
+
+/// 返回适合当前平台的录入说明，避免 Windows 用户看到 Command 按键提示。
+pub fn input_hint(os: OperatingSystem) -> &'static str {
+    if os == OperatingSystem::Mac {
+        "支持 Command / Control 组合键或 F1–F20。"
+    } else {
+        "支持 Ctrl 组合键或 F1–F20，不支持系统保留的 Win 组合键。"
+    }
+}
+
+/// 读取平台覆盖值；旧版只在 macOS 沿用自定义键，显式清除在首次跨平台时仍保留。
 pub fn key(session: &Value, shortcut: Shortcut, os: OperatingSystem) -> String {
-    session["native"]["shortcuts"][shortcut.id()]
-        .as_str()
+    let platform = &session["native"]["shortcutsByPlatform"][platform_key(os)];
+    let value = if platform.is_object() {
+        platform[shortcut.id()].as_str()
+    } else {
+        session["native"]["shortcuts"][shortcut.id()]
+            .as_str()
+            .filter(|value| os == OperatingSystem::Mac || value.is_empty())
+    };
+    value
         .map(str::to_owned)
         .unwrap_or_else(|| shortcut.default_key(os))
 }
@@ -118,15 +143,38 @@ pub fn display(session: &Value, shortcut: Shortcut, os: OperatingSystem) -> Stri
         .unwrap_or_else(|_| "无效配置".into())
 }
 
-/// 写入单项覆盖值；空字符串保留为显式禁用，不删除该键以免重启恢复默认。
-pub fn set(session: &mut Value, shortcut: Shortcut, value: &str) {
+/// 首次编辑时建立当前平台配置，保留旧版有效覆盖值及清除状态，不修改其他平台。
+fn prepare_platform(session: &mut Value, os: OperatingSystem) {
     if !session["native"].is_object() {
         session["native"] = json!({});
     }
-    if !session["native"]["shortcuts"].is_object() {
-        session["native"]["shortcuts"] = json!({});
+    if !session["native"]["shortcutsByPlatform"].is_object() {
+        session["native"]["shortcutsByPlatform"] = json!({});
     }
-    session["native"]["shortcuts"][shortcut.id()] = json!(value);
+    if !session["native"]["shortcutsByPlatform"][platform_key(os)].is_object() {
+        let mut overrides = serde_json::Map::new();
+        for shortcut in ALL {
+            if let Some(value) = session["native"]["shortcuts"][shortcut.id()]
+                .as_str()
+                .filter(|value| os == OperatingSystem::Mac || value.is_empty())
+            {
+                overrides.insert(shortcut.id().into(), json!(value));
+            }
+        }
+        session["native"]["shortcutsByPlatform"][platform_key(os)] = json!(overrides);
+    }
+}
+
+/// 写入当前平台的单项覆盖值；空字符串保留为显式禁用，旧版配置仍保留以便兼容读取。
+pub fn set(session: &mut Value, shortcut: Shortcut, value: &str, os: OperatingSystem) {
+    prepare_platform(session, os);
+    session["native"]["shortcutsByPlatform"][platform_key(os)][shortcut.id()] = json!(value);
+}
+
+/// 仅恢复当前平台默认值，空对象同时阻止旧版覆盖值重新生效。
+pub fn reset(session: &mut Value, os: OperatingSystem) {
+    prepare_platform(session, os);
+    session["native"]["shortcutsByPlatform"][platform_key(os)] = json!({});
 }
 
 /// 校验并规范化一次组合键，拒绝普通打字、重复绑定及组件已占用的编辑和导航快捷键。
@@ -145,6 +193,17 @@ pub fn validate(
     }
     let stroke = Keystroke::parse_with_os(raw, os)
         .map_err(|_| "无法识别此组合键，请重新录入。".to_owned())?;
+    if os != OperatingSystem::Mac && stroke.modifiers.platform {
+        return Err("Win 组合键由系统使用，请改用 Ctrl 组合键或功能键。".into());
+    }
+    if os == OperatingSystem::Windows
+        && ((stroke.modifiers.alt
+            && matches!(stroke.key.as_str(), "f4" | "tab" | "escape" | "space"))
+            || (stroke.modifiers.control && stroke.modifiers.alt && stroke.key == "delete")
+            || (stroke.modifiers.control && stroke.key == "escape"))
+    {
+        return Err("此组合键由 Windows 系统使用，请选择其他组合键。".into());
+    }
     if matches!(
         stroke.key.as_str(),
         "shift" | "control" | "alt" | "platform" | "function"
@@ -157,7 +216,7 @@ pub fn validate(
         .and_then(|n| n.parse::<u8>().ok())
         .is_some_and(|n| (1..=20).contains(&n));
     if !stroke.modifiers.control && !stroke.modifiers.platform && !function_key {
-        return Err("请使用包含 Command / Ctrl 的组合键或 F1–F20，避免影响正常输入。".into());
+        return Err(format!("{}避免影响正常输入。", input_hint(os)));
     }
     let normalized = stroke.unparse(os);
     for other in ALL {
@@ -253,6 +312,93 @@ fn refresh_menus(cx: &App) {
 mod tests {
     use super::*;
 
+    /// 旧版 Command 只在 macOS 生效，跨平台保留清除状态；新配置和恢复默认互不覆盖。
+    #[test]
+    fn platform_overrides_preserve_legacy_and_explicit_clear() {
+        let mut session = json!({"native":{"shortcuts":{"new":"cmd-shift-n","quit":""}}});
+        assert_eq!(
+            key(&session, Shortcut::New, OperatingSystem::Mac),
+            "cmd-shift-n"
+        );
+        assert_eq!(
+            key(&session, Shortcut::New, OperatingSystem::Windows),
+            "ctrl-n"
+        );
+        assert_eq!(key(&session, Shortcut::Quit, OperatingSystem::Windows), "");
+        set(
+            &mut session,
+            Shortcut::New,
+            "ctrl-shift-n",
+            OperatingSystem::Windows,
+        );
+        set(
+            &mut session,
+            Shortcut::Save,
+            "cmd-shift-s",
+            OperatingSystem::Mac,
+        );
+        assert_eq!(
+            key(&session, Shortcut::New, OperatingSystem::Mac),
+            "cmd-shift-n"
+        );
+        assert_eq!(
+            key(&session, Shortcut::New, OperatingSystem::Windows),
+            "ctrl-shift-n"
+        );
+        reset(&mut session, OperatingSystem::Windows);
+        let restored: Value = serde_json::from_str(&session.to_string()).unwrap();
+        assert_eq!(
+            key(&restored, Shortcut::Quit, OperatingSystem::Windows),
+            "ctrl-q"
+        );
+        assert_eq!(key(&restored, Shortcut::Quit, OperatingSystem::Mac), "");
+        assert_eq!(
+            key(&restored, Shortcut::Save, OperatingSystem::Mac),
+            "cmd-shift-s"
+        );
+        assert_eq!(restored["native"]["shortcuts"]["new"], "cmd-shift-n");
+    }
+
+    /// Windows 默认键可用；Win、系统保留键及标准复制键不能覆盖，清除绑定仍可持久化。
+    #[test]
+    fn windows_bindings_respect_system_and_editor_keys() {
+        use gpui_kit::component::input::Copy;
+        let os = OperatingSystem::Windows;
+        let session = json!({});
+        for shortcut in ALL {
+            assert!(validate(&session, shortcut, &shortcut.default_key(os), &[], os).is_ok());
+        }
+        for raw in [
+            "win-n",
+            "cmd-n",
+            "alt-f4",
+            "ctrl-alt-delete",
+            "ctrl-shift-escape",
+        ] {
+            assert!(
+                validate(&session, Shortcut::New, raw, &[], os).is_err(),
+                "{raw}"
+            );
+        }
+        let standard = [KeyBinding::new("ctrl-c", Copy, Some("Input"))];
+        assert!(validate(&session, Shortcut::New, "ctrl-c", &standard, os).is_err());
+        assert!(validate(&session, Shortcut::New, "ctrl-shift-n", &standard, os).is_ok());
+        assert!(!input_hint(os).contains("Command"));
+        assert!(input_hint(OperatingSystem::Mac).contains("Command"));
+        let mut cleared = session;
+        for shortcut in ALL {
+            set(&mut cleared, shortcut, "", os);
+        }
+        let restored: Value = serde_json::from_str(&cleared.to_string()).unwrap();
+        for shortcut in ALL {
+            assert_eq!(key(&restored, shortcut, os), "");
+            assert_eq!(
+                key(&restored, shortcut, OperatingSystem::Mac),
+                shortcut.default_key(OperatingSystem::Mac)
+            );
+        }
+    }
+
     /// 验证旧会话继承各平台默认值，清除单项后其他操作和显示偏好保持原值。
     #[test]
     fn defaults_and_explicit_clear_are_distinct() {
@@ -262,11 +408,11 @@ mod tests {
             key(&session, Shortcut::New, OperatingSystem::Linux),
             "ctrl-n"
         );
-        set(&mut session, Shortcut::New, "");
+        set(&mut session, Shortcut::New, "", OperatingSystem::Mac);
         assert_eq!(key(&session, Shortcut::New, OperatingSystem::Mac), "");
         assert_eq!(key(&session, Shortcut::Save, OperatingSystem::Mac), "cmd-s");
         assert_eq!(session["native"]["scale"], 110);
-        session["native"]["shortcuts"] = json!({});
+        reset(&mut session, OperatingSystem::Mac);
         assert_eq!(key(&session, Shortcut::New, OperatingSystem::Mac), "cmd-n");
     }
 
@@ -280,13 +426,18 @@ mod tests {
                 .unwrap_err()
                 .contains("保存接口")
         );
-        set(&mut session, Shortcut::Save, "");
+        set(&mut session, Shortcut::Save, "", OperatingSystem::Mac);
         assert_eq!(
             validate(&session, Shortcut::New, "cmd-s", &[], os).unwrap(),
             "cmd-s"
         );
         let normalized = validate(&session, Shortcut::New, "shift-cmd-n", &[], os).unwrap();
-        set(&mut session, Shortcut::New, &normalized);
+        set(
+            &mut session,
+            Shortcut::New,
+            &normalized,
+            OperatingSystem::Mac,
+        );
         assert!(validate(&session, Shortcut::Search, "cmd-shift-n", &[], os).is_err());
         assert!(validate(&session, Shortcut::New, &normalized, &[], os).is_ok());
     }
@@ -358,13 +509,13 @@ mod tests {
             key(&session, Shortcut::Search, OperatingSystem::Mac),
             "cmd-k"
         );
-        set(&mut session, Shortcut::Search, "cmd");
+        set(&mut session, Shortcut::Search, "cmd", OperatingSystem::Mac);
         assert_eq!(
             display(&session, Shortcut::Search, OperatingSystem::Mac),
             "无效配置"
         );
         for shortcut in ALL {
-            set(&mut session, shortcut, "");
+            set(&mut session, shortcut, "", OperatingSystem::Mac);
         }
         let restored = serde_json::from_str(&session.to_string()).unwrap();
         for shortcut in ALL {

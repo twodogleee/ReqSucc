@@ -71,7 +71,7 @@ impl Workbench {
                 os,
             ) {
                 Ok(key) => {
-                    shortcuts::set(&mut self.doc.session, shortcut, &key);
+                    shortcuts::set(&mut self.doc.session, shortcut, &key, os);
                     self.refresh_shortcuts(cx);
                     self.changed(cx);
                 }
@@ -101,7 +101,10 @@ impl Workbench {
         let os = cx.platform_info().os;
         let mut card = self.setting_card(
             "应用操作快捷键",
-            "点击组合键后按下新的快捷键，Esc 取消。支持 Command / Ctrl 组合键或 F1–F20。",
+            &format!(
+                "点击组合键后按下新的快捷键，Esc 取消。{}",
+                shortcuts::input_hint(os)
+            ),
             cx,
         );
         for shortcut in shortcuts::ALL {
@@ -173,7 +176,7 @@ impl Workbench {
                 )
             })
             .child(self.help(
-                "清除后仍可通过按钮和菜单操作。复制、粘贴、撤销等标准编辑快捷键保持不变。",
+                "快捷键按系统分别保存，清除或恢复默认只影响当前系统。复制、粘贴、撤销等标准编辑快捷键保持不变。",
                 cx,
             ))
             .child(

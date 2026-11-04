@@ -77,6 +77,8 @@ impl Workbench {
                 .title("重命名发布用例")
                 .child(form)
                 .confirm()
+                .ok_text("保存名称")
+                .cancel_text("取消")
                 .on_ok(move |_, _, cx| {
                     let name = state.read(cx).value().to_string();
                     let result = entity
@@ -116,10 +118,11 @@ impl Workbench {
             .w(self.scaled(28.))
             .h(self.scaled(28.))
             .icon(
-                Icon::new(if current {
-                    Icon::new(Glyph::RadioTower)
-                } else {
-                    Icon::new(IconName::Globe)
+                Icon::new(match protocol.as_str() {
+                    "mqtt" => Glyph::RadioTower,
+                    "websocket" => Glyph::Cable,
+                    "kafka" => Glyph::Network,
+                    _ => Glyph::Globe,
                 })
                 .size(self.scaled(16.))
                 .text_color(if current {
@@ -589,12 +592,12 @@ impl Workbench {
                 let timeout = self
                     .mqtt_field("timeout", "连接超时", false, true, window, cx)
                     .disabled(live);
-                v_flex().gap_3().max_w(self.scaled(620.)).child("协议版本：MQTT V5（固定）")
+                v_flex().gap_3().max_w(self.scaled(620.)).child("协议版本：MQTT V5")
                     .child(Form::horizontal().small().label_width(self.scaled(220.))
                         .child(Field::new().label("保活间隔（秒，5–65535）").child(keep))
                         .child(Field::new().label("连接超时（秒，1–300）").child(timeout)))
-                    .child(self.help("使用全新会话，断开时会话到期；连接中断后手动重连。", cx))
-                    .child(self.help("mqtts 使用系统可信证书验证 TLS；当前不支持自定义 CA、双向证书或 MQTT over WebSocket。", cx))
+                    .child(self.help("每次连接使用新会话，断开后需手动重连。", cx))
+                    .child(self.help("MQTTS 使用系统可信证书；暂不支持自定义 CA、客户端证书和 WebSocket 传输。", cx))
                     .child(self.help("发布上限 256 KiB，接收报文上限 1 MiB；消息预览最多 8 KiB，内存保留最近 500 条记录。", cx)).into_any_element()
             }
             "description" => self
@@ -1041,7 +1044,7 @@ impl Workbench {
                             .disabled(records.is_empty()),
                     )
                     .child(
-                        self.button("mqtt-clear", "清空", Action::MqttClear, cx)
+                        self.button("mqtt-clear", "清空记录", Action::MqttClear, cx)
                             .ghost()
                             .disabled(records.is_empty()),
                     ),
@@ -1056,11 +1059,7 @@ impl Workbench {
                         .justify_center()
                         .child(self.kit_empty(
                             "等待 MQTT 消息",
-                            &self.shortcut_hint(
-                                "连接后查看发布、订阅与接收记录，重启后不会自动连接。",
-                                "连接或断开",
-                                cx,
-                            ),
+                            &self.shortcut_hint("连接后查看消息记录。", "连接或断开", cx),
                             Glyph::RadioTower,
                         )),
                 )

@@ -176,7 +176,11 @@ impl Workbench {
             label.clone()
         };
         // SelectState 会渲染占满容器的实体，因此需限制外层容器尺寸，而不只是内部触发按钮。
-        let width = if key.contains("qos") {
+        let width = if (key.contains("environment") || key.contains("save-folder"))
+            && crate::desktop::compact_width(window.viewport_size().width, self.scale())
+        {
+            140.
+        } else if key.contains("qos") {
             84.
         } else if key.contains("format") {
             110.

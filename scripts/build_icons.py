@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从项目 PNG 图标生成 macOS 多分辨率 ICNS，输出覆盖 assets/ReqSucc.icns。
+"""从项目 PNG 图标生成 macOS ICNS 与 Windows ICO，覆盖 assets 中对应图标。
 
 依赖 macOS 的 sips 缩放工具，中间 PNG 存放于自动清理的临时目录。
 作者：Andersen
@@ -41,4 +41,17 @@ with tempfile.TemporaryDirectory(prefix='reqsucc-icon-') as temp:
     (root / 'assets' / 'ReqSucc.icns').write_bytes(
         b'icns' + struct.pack('>I', len(body) + 8) + body
     )
+    # Windows 10/11 支持 ICO 内嵌 PNG；目录中 0 表示 256 像素。
+    images = []
+    for size in [16, 32, 48, 64, 128, 256]:
+        output = iconset / f'windows-{size}.png'
+        subprocess.run(['sips', '-z', str(size), str(size), str(source), '--out', str(output)], check=True, stdout=subprocess.DEVNULL)
+        images.append((size, output.read_bytes()))
+    offset = 6 + 16 * len(images)
+    directory = bytearray(struct.pack('<HHH', 0, 1, len(images)))
+    for size, data in images:
+        directory.extend(struct.pack('<BBBBHHII', size % 256, size % 256, 0, 0, 1, 32, len(data), offset))
+        offset += len(data)
+    (root / 'assets' / 'ReqSucc.ico').write_bytes(bytes(directory) + b''.join(data for _, data in images))
 print(root / 'assets' / 'ReqSucc.icns')
+print(root / 'assets' / 'ReqSucc.ico')

@@ -1,0 +1,142 @@
+# 日常提交验证双平台；手动运行只提供验收包；版本标签成功后发布成品。
+name: 构建与发布
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.95.0'
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 配置 MSVC x64 环境
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: 配置 OpenSSL 与 Kafka 构建工具
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NASM 安装失败' }
+          'C:\Program Files\NASM' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          'C:\Strawberry\perl\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if (!(Test-Path 'C:\Strawberry\perl\bin\perl.exe')) { throw '未找到 Windows 原生 Perl' }
+          'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: 安装锁定工具链
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --target '${{ matrix.target }}'
+      - name: 缓存依赖下载
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: 校验版本和脚本
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: |
+          python scripts/release.py metadata --tag "$RELEASE_TAG"
+          python -m unittest discover -s scripts -p 'test_*.py'
+          cargo fmt --check
+      - name: 测试
+        run: cargo test --locked --target '${{ matrix.target }}'
+      - name: 构建开发版本
+        if: github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
+        run: cargo build --locked --target '${{ matrix.target }}'
+      - name: 构建正式版本
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        run: cargo build --release --locked --target '${{ matrix.target }}'
+      - name: 打包正式版本
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        run: python scripts/release.py package --platform '${{ matrix.platform }}' --binary-dir 'target/${{ matrix.target }}/release'
+      - name: 保存验收产物
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: target/dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  distribution:
+    name: 汇总与分发
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: target/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: target/dist
+      - name: 校验成品完整性
+        run: python scripts/release.py checksums
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: target/dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: 发布 GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          python scripts/release.py metadata --tag "$RELEASE_TAG"
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" target/dist/*.zip target/dist/SHA256SUMS.txt \
+            --verify-tag --title "ReqSucc $RELEASE_TAG" --generate-notes "${options[@]}"

@@ -377,6 +377,8 @@ pub struct Workbench {
     shortcut_error: String,
     /// 最近已自动滚入视野的活动标签标识，避免每次渲染都重置滚动。
     visible_tab: String,
+    /// 窄窗口下集合面板的临时展开状态，不覆盖大窗口的侧栏偏好。
+    compact_sidebar_open: bool,
 }
 impl Workbench {
     /// 读取并限制界面缩放为 0.9–1.25 倍，配置缺失时使用 1 倍。
@@ -580,6 +582,7 @@ impl Workbench {
             shortcut_capture: None,
             shortcut_error,
             visible_tab: String::new(),
+            compact_sidebar_open: false,
             focus: {
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
@@ -1028,7 +1031,19 @@ impl Workbench {
             Action::Format | Action::MqttFormat | Action::MessageFormat => {
                 Some(Icon::new(Glyph::Braces))
             }
-            Action::Copy => Some(Icon::new(IconName::Copy)),
+            Action::Copy | Action::MqttCopy | Action::MqttCaseNew(true) => {
+                Some(Icon::new(IconName::Copy))
+            }
+            Action::MqttClear | Action::ConfirmClearShortcuts => Some(Icon::new(Glyph::ListX)),
+            Action::ResetDisplay | Action::ResetShortcuts => Some(Icon::new(Glyph::RotateCcw)),
+            Action::MessageOp(op) => match op.as_str() {
+                "copy" => Some(Icon::new(IconName::Copy)),
+                "clear" => Some(Icon::new(Glyph::ListX)),
+                "refresh" => Some(Icon::new(Glyph::RefreshCw)),
+                "send" => Some(Icon::new(Glyph::Send)),
+                "create" => Some(Icon::new(IconName::Plus)),
+                _ => None,
+            },
             Action::Export => Some(Icon::new(Glyph::Download)),
             Action::New
             | Action::AddRow(_)
@@ -1217,14 +1232,29 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let title = title.to_owned();
+        // 明确确认按钮将执行的操作，避免破坏性操作只显示“确定”。
+        let (confirm_label, destructive) = match &action {
+            Action::ConfirmCloseTabs(_) => ("放弃并关闭", true),
+            Action::DeleteRequest(_) => ("删除接口", true),
+            Action::DeleteFolder(_) => ("删除目录", true),
+            Action::DeleteEnv(_) => ("删除环境", true),
+            Action::MqttCaseDelete(_, _) => ("删除用例", true),
+            Action::ClearShortcuts => ("清除快捷键", false),
+            _ => ("继续", false),
+        };
         let entity = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let entity = entity.clone();
             let action = action.clone();
             dialog
                 .title(title.clone())
-                .child(message.clone())
+                .child(div().typography(TextRole::Body).child(message.clone()))
                 .confirm()
+                .ok_text(confirm_label)
+                .cancel_text("取消")
+                .when(destructive, |dialog| {
+                    dialog.ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                })
                 .on_ok(move |_, window, cx| {
                     let _ = entity.update(cx, |this, cx| this.act(action.clone(), window, cx));
                     true
@@ -1238,6 +1268,12 @@ impl Workbench {
         }
         self.shortcut_recording = None;
         self.shortcut_capture = None;
+        if matches!(
+            a,
+            Action::Select(_) | Action::SelectFolder(_) | Action::New | Action::Screen(_)
+        ) {
+            self.compact_sidebar_open = false;
+        }
         match a {
             Action::ChoosePostman => self.choose_postman(window, cx),
             Action::ImportPostman => self.import_postman(cx),
@@ -1252,18 +1288,30 @@ impl Workbench {
             Action::MessageDelete(topic) => self.message_delete_dialog(topic, window, cx),
             Action::SearchFocus => {
                 self.screen = "requests".into();
-                self.doc.session["native"]["sidebarClosed"] = json!(false);
+                if crate::desktop::compact_width(window.viewport_size().width, self.scale()) {
+                    self.compact_sidebar_open = true;
+                } else {
+                    self.doc.session["native"]["sidebarClosed"] = json!(false);
+                }
                 if let Some(input) = self.fields.get("search") {
                     input.focus_handle(cx).focus(window, cx);
                 }
             }
             Action::ToggleSidebar => {
-                self.doc.session["native"]["sidebarClosed"] = json!(
-                    !self.doc.session["native"]["sidebarClosed"]
-                        .as_bool()
-                        .unwrap_or(false)
-                );
-                self.changed(cx);
+                if crate::desktop::compact_width(window.viewport_size().width, self.scale()) {
+                    self.compact_sidebar_open =
+                        self.screen == "settings" || !self.compact_sidebar_open;
+                    if self.screen == "settings" {
+                        self.screen = "requests".into();
+                    }
+                } else {
+                    self.doc.session["native"]["sidebarClosed"] = json!(
+                        !self.doc.session["native"]["sidebarClosed"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    );
+                    self.changed(cx);
+                }
             }
             Action::Expand(id) => {
                 let mut ids: Vec<String> =
@@ -1442,7 +1490,7 @@ impl Workbench {
                 } else {
                     self.confirm(
                         "删除发布用例？",
-                        "删除后该用例的主题和消息内容将从当前连接中移除。".into(),
+                        "此用例的主题和消息内容将被删除，无法撤销。".into(),
                         Action::MqttCaseDelete(text(&self.doc.session, "activeId"), id),
                         window,
                         cx,
@@ -1570,7 +1618,7 @@ impl Workbench {
             }
             Action::ConfirmDeleteRequest(id) => self.confirm(
                 "删除接口？",
-                "将删除此接口和对应草稿，此操作无法撤销。".into(),
+                "接口和对应草稿将被删除，无法撤销。".into(),
                 Action::DeleteRequest(id),
                 window,
                 cx,
@@ -1697,7 +1745,7 @@ impl Workbench {
             Action::RecordShortcut(shortcut) => self.record_shortcut(shortcut, window, cx),
             Action::CancelShortcut => self.shortcut_error.clear(),
             Action::ClearShortcut(shortcut) => {
-                shortcuts::set(&mut self.doc.session, shortcut, "");
+                shortcuts::set(&mut self.doc.session, shortcut, "", cx.platform_info().os);
                 self.refresh_shortcuts(cx);
                 self.changed(cx);
             }
@@ -1705,7 +1753,7 @@ impl Workbench {
                 if !window.has_active_dialog(cx) {
                     self.confirm(
                         "清除全部快捷键",
-                        "清除所有应用操作快捷键，保留标准编辑快捷键。之后可通过本页恢复默认。"
+                        "清除当前系统的应用快捷键，可随时恢复默认。标准编辑快捷键和其他系统的配置不受影响。"
                             .into(),
                         Action::ClearShortcuts,
                         window,
@@ -1715,13 +1763,13 @@ impl Workbench {
             }
             Action::ClearShortcuts => {
                 for shortcut in shortcuts::ALL {
-                    shortcuts::set(&mut self.doc.session, shortcut, "");
+                    shortcuts::set(&mut self.doc.session, shortcut, "", cx.platform_info().os);
                 }
                 self.refresh_shortcuts(cx);
                 self.changed(cx);
             }
             Action::ResetShortcuts => {
-                self.doc.session["native"]["shortcuts"] = json!({});
+                shortcuts::reset(&mut self.doc.session, cx.platform_info().os);
                 self.refresh_shortcuts(cx);
                 self.changed(cx);
             }
@@ -1848,8 +1896,12 @@ impl Workbench {
             .count();
         if !self.confirmed_unsaved_tab_close && dirty > 0 {
             self.confirm(
-                "关闭未保存的请求？",
-                format!("将关闭 {} 个标签，其中 {} 个含有未保存修改，关闭后这些修改将被丢弃。本次运行期间再次关闭未保存的标签时，将直接丢弃修改，不再提醒；需要保留请先保存接口。正常退出应用会自动恢复草稿。", ids.len(), dirty),
+                "放弃修改并关闭？",
+                if ids.len() == 1 {
+                    "未保存的修改将丢失。\n确认后，本次启动不再提醒。".into()
+                } else {
+                    format!("将关闭 {} 个标签，其中 {} 个有未保存修改。\n修改将丢失，确认后本次启动不再提醒。", ids.len(), dirty)
+                },
                 Action::ConfirmCloseTabs(ids), window, cx,
             );
         } else {
@@ -2065,6 +2117,7 @@ impl Workbench {
             .typography(TextRole::Control)
             .danger()
             .outline()
+            .icon(Icon::new(Glyph::Trash).size(self.scaled(crate::theme::ICON_SIZE)))
             .label(label.clone())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.confirm(&label, message.clone(), action.clone(), window, cx)
@@ -2432,7 +2485,7 @@ impl Workbench {
                 .child(
                     self.kit_empty(
                         "从一个请求开始",
-                        "创建请求或从左侧集合打开接口，所有数据保存在本地。",
+                        "新建请求，或从集合中打开已保存的接口。",
                         Glyph::Send,
                     )
                     .content(
@@ -2551,7 +2604,7 @@ impl Workbench {
                             .size(self.scaled(crate::theme::ICON_SIZE))
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(div().flex_1().child(name.appearance(false)))
+                    .child(div().flex_1().min_w_0().child(name.appearance(false)))
                     .child(self.select("save-folder", folder_name, folders, window, cx))
                     .child(
                         self.button("save-request", "保存", Action::Save, cx)
@@ -2717,11 +2770,7 @@ impl Workbench {
                         .justify_center()
                         .child(self.kit_empty(
                             "等待响应",
-                            &self.shortcut_hint(
-                                "发送请求后，在这里查看服务器返回的内容。",
-                                "发送或取消当前请求",
-                                cx,
-                            ),
+                            &self.shortcut_hint("发送请求后查看响应。", "发送或取消当前请求", cx),
                             Glyph::Send,
                         )),
                 )
@@ -2784,14 +2833,11 @@ impl Workbench {
             );
         }
         if self.response_tab == "cookies" {
-            panel =
-                panel.child(self.help("Cookie 值默认隐藏，本阶段仅展示，不自动保存或回传。", cx));
+            panel = panel.child(self.help("Cookie 值默认隐藏，不会自动保存或随请求发送。", cx));
         }
         if self.response_tab == "request" {
-            panel = panel.child(self.help(
-                "有效请求预览已隐藏认证和敏感变量；重定向后的实际请求可能不同。",
-                cx,
-            ));
+            panel =
+                panel.child(self.help("认证信息与敏感变量已隐藏；重定向后的请求可能不同。", cx));
         }
         if self.response_tab == "body" && !r.binary {
             panel = panel.child(
@@ -2843,7 +2889,7 @@ impl Workbench {
         else {
             return div()
                 .p_4()
-                .child(self.help("从左侧选择集合或新建集合", cx))
+                .child(self.help("选择集合，或新建一个集合。", cx))
                 .into_any_element();
         };
         let name = self.field(
@@ -3143,11 +3189,11 @@ impl Workbench {
         let page = self.settings_page.clone();
         let mut menu = SidebarMenu::new();
         for (id, name, icon) in [
-            ("display", "显示设置", IconName::Settings2),
-            ("shortcuts", "快捷键", IconName::Settings2),
-            ("storage", "数据存储", IconName::HardDrive),
-            ("network", "请求设置", IconName::Globe),
-            ("about", "关于 ReqSucc", IconName::Info),
+            ("display", "显示设置", Glyph::Monitor),
+            ("shortcuts", "快捷键", Glyph::Keyboard),
+            ("storage", "数据存储", Glyph::HardDrive),
+            ("network", "请求设置", Glyph::Globe),
+            ("about", "关于 ReqSucc", Glyph::Info),
         ] {
             menu = menu.child(
                 SidebarMenuItem::new(name)
@@ -3171,13 +3217,36 @@ impl Workbench {
         };
         // 活动栏采用组件库固定 48 逻辑像素的折叠侧栏，设置导航与内边距跟随主题缩放。
         // 布局断点依据剩余内容宽度，避免将活动栏宽度重复计入缩放。
-        let available = (f32::from(window.viewport_size().width) - 48.) / self.scale() - 176. - 24.;
+        let compact_navigation =
+            crate::desktop::compact_width(window.viewport_size().width, self.scale());
+        let available = (f32::from(window.viewport_size().width) - 48.) / self.scale()
+            - if compact_navigation { 24. } else { 200. };
         let compact = available < 660.;
         let mut content = v_flex()
             .w_full()
             .min_w_0()
             .max_w(self.scaled(720.))
             .gap_3()
+            .when(compact_navigation, |content| {
+                content.child(
+                    self.dropdown(
+                        "compact-settings-navigation",
+                        heading,
+                        [
+                            ("display", "显示设置"),
+                            ("shortcuts", "快捷键"),
+                            ("storage", "数据存储"),
+                            ("network", "请求设置"),
+                            ("about", "关于 ReqSucc"),
+                        ]
+                        .into_iter()
+                        .map(|(id, name)| (name.into(), Action::SettingsPage(id.into())))
+                        .collect(),
+                        false,
+                        cx,
+                    ),
+                )
+            })
             .child(
                 h_flex().child(
                     self.button(
@@ -3196,9 +3265,10 @@ impl Workbench {
                     .gap_1()
                     .pb_1()
                     .child(self.page_title(heading, cx))
-                    .when(page != "about", |el| {
-                        el.child(self.help("修改后自动保存，下次打开继续使用。", cx))
-                    }),
+                    .when(
+                        matches!(page.as_str(), "display" | "network" | "shortcuts"),
+                        |el| el.child(self.help("设置自动保存。", cx)),
+                    ),
             );
         match page.as_str() {
             "storage" => {
@@ -3235,7 +3305,7 @@ impl Workbench {
                                                     cx,
                                                 )
                                                 .icon(
-                                                    Icon::new(IconName::Folder)
+                                                    Icon::new(Glyph::FolderInput)
                                                         .size(self.scaled(crate::theme::ICON_SIZE)),
                                                 )
                                                 .primary()
@@ -3334,69 +3404,65 @@ impl Workbench {
             }
             "about" => {
                 content = content.child(
-                    self.setting_card("ReqSucc 0.4.0", "全中文本地接口工作台", cx)
-                        .child(
-                            v_flex()
-                                .p_3()
-                                .gap_4()
-                                .child(
-                                    h_flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .child(
-                                            svg()
-                                                .path("brand/flying-cat.svg")
-                                                .size(self.scaled(48.))
-                                                .text_color(cx.theme().foreground),
-                                        )
-                                        .child("请求成功，调试从容。"),
-                                )
-                                .child(self.help(
-                                    "数据保存在本机，支持 HTTP、MQTT V5、WebSocket 与 Kafka 调试。",
-                                    cx,
-                                ))
-                                .child(self.help("当前不提供脚本、断言测试或云同步。", cx))
-                                .child(
-                                    v_flex()
-                                        .gap_3()
-                                        .pt_4()
-                                        .border_t_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            h_flex()
-                                                .flex_wrap()
-                                                .gap_2()
-                                                .child(self.help("作者：", cx))
-                                                .child(self.copy("Andersen", TextRole::Body, cx)),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .flex_wrap()
-                                                .gap_2()
-                                                .child(self.help("作者网站：", cx))
-                                                .child(self.about_link(
-                                                    "about-author-website",
-                                                    "36knight.com",
-                                                    "https://36knight.com",
-                                                )),
-                                        )
-                                        .child(self.help(
-                                            "ReqSucc 是开源项目，采用 Apache License 2.0 协议。",
-                                            cx,
-                                        ))
-                                        .child(
-                                            h_flex()
-                                                .flex_wrap()
-                                                .gap_2()
-                                                .child(self.help("源码地址：", cx))
-                                                .child(self.about_link(
-                                                    "about-source-repository",
-                                                    "github.com/twodogleee/ReqSucc",
-                                                    "https://github.com/twodogleee/ReqSucc",
-                                                )),
-                                        ),
-                                ),
-                        ),
+                    self.setting_card(
+                        concat!("ReqSucc ", env!("CARGO_PKG_VERSION")),
+                        "本地接口调试工具",
+                        cx,
+                    )
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_4()
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .child(
+                                        svg()
+                                            .path("brand/flying-cat.svg")
+                                            .size(self.scaled(48.))
+                                            .text_color(cx.theme().foreground),
+                                    )
+                                    .child("请求成功，调试从容。"),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .pt_4()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        h_flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(self.help("作者：", cx))
+                                            .child(self.copy("Andersen", TextRole::Body, cx)),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(self.help("个人主页：", cx))
+                                            .child(self.about_link(
+                                                "about-author-website",
+                                                "36knight.com",
+                                                "https://36knight.com",
+                                            )),
+                                    )
+                                    .child(self.help("开源许可：Apache License 2.0", cx))
+                                    .child(
+                                        h_flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .child(self.help("项目源码：", cx))
+                                            .child(self.about_link(
+                                                "about-source-repository",
+                                                "github.com/twodogleee/ReqSucc",
+                                                "https://github.com/twodogleee/ReqSucc",
+                                            )),
+                                    ),
+                            ),
+                    ),
                 );
             }
             _ => {
@@ -3436,10 +3502,10 @@ impl Workbench {
                     cx,
                 );
                 content = content.child(
-                    self.setting_card("外观与布局", "统一调整工作台的颜色、尺寸和分区边界。", cx)
+                    self.setting_card("外观与布局", "设置主题、缩放与边框。", cx)
                         .child(self.setting_row(
                             "界面主题",
-                            "选择适合当前光线的配色。",
+                            "使用深色或浅色外观。",
                             themes,
                             compact,
                             cx,
@@ -3494,7 +3560,7 @@ impl Workbench {
                 );
                 content = content
                     .child(
-                        self.setting_card("编辑器", "同时应用于请求体与响应内容。", cx)
+                        self.setting_card("编辑器", "用于请求、响应与消息编辑区。", cx)
                             .child(self.setting_row(
                                 "编辑器字号",
                                 "单独调整代码文字大小。",
@@ -3541,7 +3607,7 @@ impl Workbench {
         }
         h_flex()
             .size_full()
-            .child(nav)
+            .when(!compact_navigation, |row| row.child(nav))
             .child(
                 div()
                     .id("settings-scroll")
@@ -3559,7 +3625,7 @@ impl Workbench {
         let search = self
             .field(
                 Binding::Search,
-                "搜索接口名称或地址",
+                "搜索请求名称或地址",
                 false,
                 false,
                 window,
@@ -3822,12 +3888,12 @@ impl Workbench {
             .into_any_element()
     }
     /// 绘制工作台活动导航栏，连接请求、环境、设置和主题切换入口。
-    fn rail(&self, cx: &Context<Self>) -> AnyElement {
+    fn rail(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
         let mut menu = SidebarMenu::new();
         for (label, icon, screen) in [
             ("集合", Glyph::Layers, "requests"),
             ("环境", Glyph::SlidersHorizontal, "environments"),
-            ("历史（即将开放）", Glyph::Clock, "history"),
+            ("历史记录（暂不可用）", Glyph::Clock, "history"),
         ] {
             let selected =
                 self.screen == screen || (screen == "requests" && self.screen == "folder");
@@ -3838,7 +3904,11 @@ impl Workbench {
                     .active(selected)
                     .disable(screen == "history" || (!self.ready && screen == "environments"))
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        this.act(Action::Screen(screen.into()), w, cx)
+                        this.act(Action::Screen(screen.into()), w, cx);
+                        if compact && screen == "requests" {
+                            this.compact_sidebar_open = true;
+                            cx.notify();
+                        }
                     })),
             );
         }
@@ -3860,22 +3930,23 @@ impl Workbench {
                         Action::Screen("settings".into()),
                         cx,
                     ))
-                    .child(
-                        self.icon_button(
-                            "toggle-sidebar",
-                            "展开或收起侧栏",
-                            if self.doc.session["native"]["sidebarClosed"]
+                    .child(self.icon_button(
+                        "toggle-sidebar",
+                        "展开或收起侧栏",
+                        if if compact {
+                            !self.compact_sidebar_open
+                        } else {
+                            self.doc.session["native"]["sidebarClosed"]
                                 .as_bool()
                                 .unwrap_or(false)
-                            {
-                                IconName::PanelLeftOpen
-                            } else {
-                                IconName::PanelLeftClose
-                            },
-                            Action::ToggleSidebar,
-                            cx,
-                        ),
-                    ),
+                        } {
+                            IconName::PanelLeftOpen
+                        } else {
+                            IconName::PanelLeftClose
+                        },
+                        Action::ToggleSidebar,
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -3883,6 +3954,10 @@ impl Workbench {
 impl Render for Workbench {
     /// 组装原生标题栏、侧栏、可拖动标签及可调整尺寸的主面板，并显示保存和运行状态。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact_width =
+            crate::desktop::compact_width(window.viewport_size().width, self.scale());
+        let compact_height =
+            crate::desktop::compact_height(window.viewport_size().height, self.scale());
         let mut environments = vec![("未选择环境".into(), Action::SelectEnv(String::new()))];
         let mut environment_name = "未选择环境".to_owned();
         if let Some(envs) = self.doc.session["network"]["environments"].as_array() {
@@ -3894,12 +3969,14 @@ impl Render for Workbench {
                 environments.push((name, Action::SelectEnv(text(e, "id"))));
             }
         }
+        let search_key =
+            shortcuts::display(&self.doc.session, Shortcut::Search, cx.platform_info().os);
         let top = h_flex()
-            .w_full()
+            .flex_1()
+            .min_w_0()
             .h_full()
-            .px_4()
-            .gap_3()
-            .flex_shrink_0()
+            .px_2()
+            .gap_2()
             .bg(if cx.theme().mode.is_dark() {
                 rgb(0x24272a).into()
             } else {
@@ -3907,7 +3984,7 @@ impl Render for Workbench {
             })
             .child(
                 h_flex()
-                    .w(self.scaled(150.))
+                    .flex_shrink_0()
                     .gap_2()
                     .child(
                         svg()
@@ -3915,24 +3992,49 @@ impl Render for Workbench {
                             .size(self.scaled(28.))
                             .text_color(cx.theme().foreground),
                     )
-                    .child(
-                        div()
-                            .text_size(self.scaled(16.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("ReqSucc"),
-                    ),
+                    .when(!compact_width, |row| {
+                        row.child(
+                            div()
+                                .text_size(self.scaled(16.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("ReqSucc"),
+                        )
+                    }),
             )
+            .when(cx.platform_info().os != OperatingSystem::Mac, |row| {
+                let focus = self.focus.clone();
+                row.child(
+                    Button::new("application-menu")
+                        .small()
+                        .label("菜单")
+                        .accessibility_label("应用菜单")
+                        .dropdown_menu(move |menu, _, _| {
+                            menu.action_context(focus.clone())
+                                .menu("新建请求", Box::new(NewRequest))
+                                .menu("保存接口", Box::new(SaveRequest))
+                                .menu("发送 / 取消 / 连接", Box::new(SendRequest))
+                                .menu("关闭当前标签", Box::new(CloseTab))
+                                .separator()
+                                .menu("设置", Box::new(Settings))
+                                .menu("退出 ReqSucc", Box::new(Quit))
+                        }),
+                )
+            })
             .child(
-                h_flex().flex_1().justify_center().child(
+                h_flex().flex_1().min_w_0().justify_center().child(
                     Button::new("global-search")
                         .ghost()
-                        .w(self.scaled(270.))
+                        .w_full()
+                        .max_w(self.scaled(270.))
+                        .min_w_0()
                         .h(self.scaled(crate::theme::CONTROL_HEIGHT))
                         .border_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().background)
                         .text_color(cx.theme().muted_foreground)
-                        .accessibility_label("搜索接口")
+                        .accessibility_label("查找请求")
+                        .tooltip("在集合中按名称或地址查找已保存的请求")
+                        .font_weight(FontWeight::NORMAL)
                         .child(
                             h_flex()
                                 .w_full()
@@ -3945,15 +4047,22 @@ impl Render for Workbench {
                                     div()
                                         .flex_1()
                                         .typography(TextRole::Control)
-                                        .child("搜索接口"),
+                                        .min_w_0()
+                                        .truncate()
+                                        .child("查找请求…"),
                                 )
-                                .child(div().typography(TextRole::Caption).child(
-                                    shortcuts::display(
-                                        &self.doc.session,
-                                        Shortcut::Search,
-                                        cx.platform_info().os,
-                                    ),
-                                )),
+                                .when(!search_key.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1()
+                                            .rounded(self.scaled(3.))
+                                            .border_1()
+                                            .border_color(cx.theme().border)
+                                            .typography(TextRole::Caption)
+                                            .child(search_key.clone()),
+                                    )
+                                }),
                         )
                         .on_click(
                             cx.listener(|this, _, w, cx| this.act(Action::SearchFocus, w, cx)),
@@ -3962,21 +4071,23 @@ impl Render for Workbench {
             )
             .child(
                 div()
-                    .max_w(self.scaled(180.))
+                    .max_w(self.scaled(if compact_width { 140. } else { 180. }))
+                    .min_w_0()
                     .overflow_hidden()
                     .child(self.select("environment", environment_name, environments, window, cx)),
             );
-        let sidebar = self.sidebar(window, cx);
-        let rail = self.rail(cx);
+        let mut sidebar = Some(self.sidebar(window, cx));
+        let rail = self.rail(compact_width, cx);
         let content = match self.screen.as_str() {
             "settings" => self.settings(window, cx),
             "environments" => self.environments(window, cx),
             "folder" => self.folder_panel(window, cx),
             _ => {
                 let count = model::tabs(&self.doc).len();
-                let sidebar_width = if self.doc.session["native"]["sidebarClosed"]
-                    .as_bool()
-                    .unwrap_or(false)
+                let sidebar_width = if compact_width
+                    || self.doc.session["native"]["sidebarClosed"]
+                        .as_bool()
+                        .unwrap_or(false)
                 {
                     0.
                 } else {
@@ -4162,48 +4273,55 @@ impl Render for Workbench {
                             .border_color(cx.theme().border)
                             .child(div().flex_1().min_w_0().h_full().child(tabs)),
                     )
-                    .child(
-                        div().flex_1().min_h_0().child(
-                            v_resizable("request-response")
-                                .on_resize(cx.listener(
-                                    |this,
-                                     state: &Entity<
-                                        gpui_kit::component::resizable::ResizableState,
-                                    >,
-                                     _,
-                                     cx| {
-                                        if let Some(size) = state.read(cx).sizes().first() {
-                                            this.doc.session["native"]["requestHeight"] =
-                                                json!(f32::from(*size) / this.scale());
-                                            this.changed(cx)
-                                        }
-                                    },
-                                ))
-                                .child(
-                                    resizable_panel()
-                                        .size(
-                                            self.scaled(
-                                                self.doc.session["native"]["requestHeight"]
-                                                    .as_f64()
-                                                    .unwrap_or(390.)
-                                                    as f32,
-                                            ),
-                                        )
-                                        .size_range(self.scaled(230.)..self.scaled(1200.))
-                                        .child(request),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size(self.scaled(350.))
-                                        .size_range(self.scaled(190.)..self.scaled(1200.))
-                                        .child(response),
-                                ),
-                        ),
-                    )
+                    .child(div().flex_1().min_h_0().child(if compact_height {
+                        // 矮窗口保留可操作的表单和消息区域，通过外层滚动访问响应，不写入分栏偏好。
+                        v_flex()
+                            .id("compact-request-response")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .child(div().h(self.scaled(390.)).flex_shrink_0().child(request))
+                            .child(div().h(self.scaled(300.)).flex_shrink_0().child(response))
+                            .into_any_element()
+                    } else {
+                        v_resizable("request-response")
+                            .on_resize(cx.listener(
+                                |this,
+                                 state: &Entity<gpui_kit::component::resizable::ResizableState>,
+                                 _,
+                                 cx| {
+                                    if let Some(size) = state.read(cx).sizes().first() {
+                                        this.doc.session["native"]["requestHeight"] =
+                                            json!(f32::from(*size) / this.scale());
+                                        this.changed(cx)
+                                    }
+                                },
+                            ))
+                            .child(
+                                resizable_panel()
+                                    .size(
+                                        self.scaled(
+                                            self.doc.session["native"]["requestHeight"]
+                                                .as_f64()
+                                                .unwrap_or(390.)
+                                                as f32,
+                                        ),
+                                    )
+                                    .size_range(self.scaled(230.)..self.scaled(1200.))
+                                    .child(request),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(self.scaled(350.))
+                                    .size_range(self.scaled(190.)..self.scaled(1200.))
+                                    .child(response),
+                            )
+                            .into_any_element()
+                    }))
                     .into_any_element()
             }
         };
-        let work = if self.screen == "settings"
+        let work = if compact_width
+            || self.screen == "settings"
             || self.doc.session["native"]["sidebarClosed"]
                 .as_bool()
                 .unwrap_or(false)
@@ -4233,7 +4351,7 @@ impl Render for Workbench {
                             ),
                         )
                         .size_range(self.scaled(220.)..self.scaled(420.))
-                        .child(sidebar),
+                        .children(sidebar.take()),
                 )
                 .child(resizable_panel().child(content))
                 .into_any_element()
@@ -4247,6 +4365,18 @@ impl Render for Workbench {
             .id("reqsucc-workbench")
             .relative()
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.compact_sidebar_open
+                    && event.keystroke.key == "escape"
+                    && !event.keystroke.modifiers.modified()
+                    && !window.has_active_dialog(cx)
+                {
+                    this.compact_sidebar_open = false;
+                    this.focus.focus(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -4265,6 +4395,42 @@ impl Render for Workbench {
                     .min_h_0()
                     .child(rail)
                     .child(div().flex_1().min_w_0().h_full().child(work)),
+            )
+            .when(
+                compact_width && self.compact_sidebar_open && self.screen != "settings",
+                |el| {
+                    el.child(
+                        div()
+                            .id("compact-collections-overlay")
+                            .absolute()
+                            .top(self.scaled(42.))
+                            .left(px(48.))
+                            .right_0()
+                            .bottom_7()
+                            .bg(rgba(0x00000030))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.compact_sidebar_open = false;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(self.scaled(272.))
+                                    .max_w(relative(0.9))
+                                    .h_full()
+                                    .bg(cx.theme().background)
+                                    .shadow_lg()
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .children(sidebar.take()),
+                            ),
+                    )
+                },
             )
             .when(!error.is_empty(), |el| {
                 // 错误浮层脱离主布局，不改变分栏尺寸或触发尺寸持久化；层级低于菜单和确认弹窗。
@@ -4358,7 +4524,7 @@ impl Render for Workbench {
                     })
                     .right(
                         div()
-                            .max_w(self.scaled(520.))
+                            .max_w(self.scaled(if compact_width { 220. } else { 520. }))
                             .truncate()
                             .child(self.path.clone()),
                     )

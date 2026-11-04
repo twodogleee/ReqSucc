@@ -2,10 +2,18 @@
 //!
 //! 作者：Andersen
 
+// 正式 Windows 应用使用图形子系统，调试构建仍保留终端诊断输出。
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 /// 品牌与组件图标的统一资源入口。
 mod assets;
 /// 存储命令队列和界面事件桥接。
 mod backend;
+/// 平台窗口布局与启动阶段的原生提示。
+mod desktop;
 /// HTTP 请求执行、认证与响应缓存。
 mod http;
 /// Kafka 认证、发布消费与主题管理。
@@ -34,27 +42,43 @@ use gpui_kit::{
 };
 
 /// 获取单实例锁后启动网络运行时和原生工作台，注册中文菜单与快捷键。
-///
-/// # Panics
-/// 无法创建配置目录、运行锁、网络运行时或主窗口时终止启动。
 fn main() {
     use fs2::FileExt;
     let home = backend::data_home();
-    std::fs::create_dir_all(&home).expect("无法创建应用配置目录");
-    let instance = std::fs::OpenOptions::new()
+    if let Err(error) = std::fs::create_dir_all(&home) {
+        desktop::startup_notice(&format!("无法创建应用配置目录：{error}"), true);
+        return;
+    }
+    let instance = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(home.join(".desktop-instance.lock"))
-        .expect("无法创建应用运行锁");
-    if instance.try_lock_exclusive().is_err() {
-        eprintln!("ReqSucc 已在运行，请切换到已打开的窗口。");
+    {
+        Ok(instance) => instance,
+        Err(error) => {
+            desktop::startup_notice(&format!("无法创建应用运行锁：{error}"), true);
+            return;
+        }
+    };
+    if let Err(error) = instance.try_lock_exclusive() {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            desktop::startup_notice("ReqSucc 已在运行，请切换到已打开的窗口。", false);
+        } else {
+            desktop::startup_notice(&format!("无法锁定应用配置目录：{error}"), true);
+        }
         return;
     }
 
     // Tokio 驱动网络 I/O，GPUI 驱动原生事件循环；网络等待不占用界面线程。
-    let runtime = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("无法启动网络运行时"));
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => std::sync::Arc::new(runtime),
+        Err(error) => {
+            desktop::startup_notice(&format!("无法启动网络运行时：{error}"), true);
+            return;
+        }
+    };
     gpui_kit::application()
         .with_assets(assets::AppAssets)
         .run(move |cx| {
@@ -62,10 +86,15 @@ fn main() {
             component::set_locale("zh-CN");
             theme::apply(false, &serde_json::json!({}), cx);
 
-            gpui_kit::open_window(
+            let visible = cx
+                .primary_display()
+                .map(|display| display.visible_bounds())
+                .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(800.))));
+            let (bounds, minimum) = desktop::window_geometry(visible);
+            if let Err(error) = gpui_kit::open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::centered(size(px(1440.), px(940.)), cx)),
-                    window_min_size: Some(size(px(1100.), px(720.))),
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(minimum),
                     ..component::TitleBar::window_options()
                 },
                 cx,
@@ -75,8 +104,11 @@ fn main() {
                     ui::Workbench::register(&view, window.window_handle(), cx);
                     view
                 },
-            )
-            .expect("无法打开 ReqSucc 窗口");
+            ) {
+                desktop::startup_notice(&format!("无法打开 ReqSucc 窗口：{error}"), true);
+                cx.quit();
+                return;
+            }
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

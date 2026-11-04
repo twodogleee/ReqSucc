@@ -180,10 +180,11 @@ impl Workbench {
                 (entity.clone(), tab.clone(), identity.clone(), topic.clone());
             dialog
                 .title("删除 Kafka 主题")
-                .child(format!(
-                    "将从集群删除主题“{topic}”及其中的数据，此操作无法撤销。是否继续？"
-                ))
+                .child(format!("将从集群删除主题“{topic}”及其中的数据，无法撤销。"))
                 .confirm()
+                .ok_text("删除主题")
+                .cancel_text("取消")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     let _ = entity.update(cx, |this, cx| {
                         let result = if text(&this.doc.session, "activeId") != tab {
@@ -878,7 +879,7 @@ impl Workbench {
                 .child(
                     self.button(
                         "message-clear",
-                        "清空",
+                        "清空记录",
                         Action::MessageOp("clear".into()),
                         cx,
                     )
@@ -888,7 +889,10 @@ impl Workbench {
         );
         if records.is_empty() {
             return panel
-                .child(self.help("连接后查看消息与操作结果。消息记录仅保留在本次会话中。", cx))
+                .child(self.help(
+                    "连接后可查看收发消息与操作结果，记录仅在本次会话中保留。",
+                    cx,
+                ))
                 .into_any_element();
         }
         let selected = self

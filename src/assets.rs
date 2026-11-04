@@ -17,7 +17,16 @@ gpui_kit::assets::icon_assets!(
         Braces,
         Download,
         CircleStop,
-        CircleQuestionMark
+        CircleQuestionMark,
+        Monitor,
+        Keyboard,
+        ListX,
+        RotateCcw,
+        RefreshCw,
+        FolderInput,
+        FileInput,
+        Cable,
+        Network
     ]
 );
 /// 为原生界面提供编译期嵌入的品牌图标与组件库资源。
