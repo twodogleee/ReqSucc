@@ -117,20 +117,21 @@ impl Workbench {
             .small()
             .w(self.scaled(28.))
             .h(self.scaled(28.))
-            .icon(
+            .p_0()
+            .child(super::centered_icon::centered_icon(
                 Icon::new(match protocol.as_str() {
                     "mqtt" => Glyph::RadioTower,
                     "websocket" => Glyph::Cable,
                     "kafka" => Glyph::Network,
                     _ => Glyph::Globe,
                 })
-                .size(self.scaled(16.))
                 .text_color(if current {
                     rgb(0xb99ae9).into()
                 } else {
                     cx.theme().primary
                 }),
-            )
+                self.scaled(crate::theme::BASE_FONT_SIZE * 0.875),
+            ))
             .accessibility_label("切换请求协议")
             .tooltip("切换请求协议")
             .dropdown_menu(move |menu, _, _| {

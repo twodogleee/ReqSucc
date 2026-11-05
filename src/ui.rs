@@ -2,6 +2,8 @@
 //!
 //! 作者：Andersen
 
+/// 按实际设备像素边界居中的图标绘制。
+mod centered_icon;
 /// 基于 GPUI Kit 的统一文字、表格、选择器和表单控件组合。
 mod controls;
 use crate::theme::{TextRole, TypographyExt};
@@ -12,7 +14,10 @@ mod messaging_view;
 mod mqtt_view;
 /// Postman 文件选择、导入预览与事务结果反馈。
 mod postman_view;
+/// 工作台活动栏的居中图标与导航交互。
+mod rail;
 use crate::{kafka, messaging, websocket};
+use rail::ActivityMenu;
 /// 应用快捷键设置页与按键录入交互。
 mod shortcuts_view;
 use crate::mqtt;
@@ -439,11 +444,12 @@ impl Workbench {
     ) -> Button {
         let destructive = matches!(&action, Action::RemoveRow(_, _));
         Button::new(id)
-            .icon(
+            // 小号 Button 原本将图标尺寸覆盖为 0.875 rem；保留该视觉尺寸并按内容区居中。
+            .child(centered_icon::centered_icon(
                 icon.into()
-                    .size(self.scaled(crate::theme::ICON_SIZE))
                     .when(destructive, |icon| icon.text_color(cx.theme().danger)),
-            )
+                self.scaled(crate::theme::BASE_FONT_SIZE * 0.875),
+            ))
             .accessibility_label(label.to_owned())
             .tooltip(label.to_owned())
             .ghost()
@@ -1120,18 +1126,27 @@ impl Workbench {
                     .w_full()
                     .min_w_0()
                     .gap_2()
-                    .when(empty, |row| row.justify_center())
+                    .when(empty, |row| {
+                        row.h_full().child(centered_icon::centered_icon(
+                            Icon::new(if more {
+                                Icon::new(Glyph::Ellipsis)
+                            } else {
+                                Icon::new(IconName::ChevronDown)
+                            }),
+                            self.scaled(crate::theme::ICON_SIZE),
+                        ))
+                    })
                     .when(!empty, |row| {
                         row.child(div().flex_1().min_w_0().truncate().child(label))
-                    })
-                    .child(
-                        Icon::new(if more {
-                            Icon::new(Glyph::Ellipsis)
-                        } else {
-                            Icon::new(IconName::ChevronDown)
-                        })
-                        .size(self.scaled(crate::theme::ICON_SIZE)),
-                    ),
+                            .child(
+                                Icon::new(if more {
+                                    Icon::new(Glyph::Ellipsis)
+                                } else {
+                                    Icon::new(IconName::ChevronDown)
+                                })
+                                .size(self.scaled(crate::theme::ICON_SIZE)),
+                            )
+                    }),
             )
             .dropdown_menu(move |menu, _, _| {
                 Self::populate_menu(menu, &items, entity.clone(), scale)
@@ -3889,7 +3904,7 @@ impl Workbench {
     }
     /// 绘制工作台活动导航栏，连接请求、环境、设置和主题切换入口。
     fn rail(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
-        let mut menu = SidebarMenu::new();
+        let mut menu = ActivityMenu::new();
         for (label, icon, screen) in [
             ("集合", Glyph::Layers, "requests"),
             ("环境", Glyph::SlidersHorizontal, "environments"),
@@ -3897,19 +3912,18 @@ impl Workbench {
         ] {
             let selected =
                 self.screen == screen || (screen == "requests" && self.screen == "folder");
-            menu = menu.child(
-                SidebarMenuItem::new(label)
-                    .icon(icon)
-                    .accessibility_label(label)
-                    .active(selected)
-                    .disable(screen == "history" || (!self.ready && screen == "environments"))
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        this.act(Action::Screen(screen.into()), w, cx);
-                        if compact && screen == "requests" {
-                            this.compact_sidebar_open = true;
-                            cx.notify();
-                        }
-                    })),
+            menu.push(
+                label,
+                icon,
+                selected,
+                screen == "history" || (!self.ready && screen == "environments"),
+                cx.listener(move |this, _, w, cx| {
+                    this.act(Action::Screen(screen.into()), w, cx);
+                    if compact && screen == "requests" {
+                        this.compact_sidebar_open = true;
+                        cx.notify();
+                    }
+                }),
             );
         }
         Sidebar::new("activity-navigation")
@@ -3921,6 +3935,8 @@ impl Workbench {
             .child(SidebarGroup::new("工作台").child(menu))
             .footer(
                 v_flex()
+                    // 侧栏 footer 的横向容器不会自动拉伸子元素；占满宽度后才能随缩放保持居中。
+                    .w_full()
                     .gap_2()
                     .items_center()
                     .child(self.icon_button(
@@ -4468,11 +4484,12 @@ impl Render for Workbench {
                                             .m_1()
                                             .w(self.scaled(28.))
                                             .h(self.scaled(28.))
-                                            .icon(
+                                            .p_0()
+                                            .child(centered_icon::centered_icon(
                                                 Icon::new(IconName::Close)
-                                                    .size(self.scaled(16.))
                                                     .text_color(cx.theme().danger),
-                                            )
+                                                self.scaled(crate::theme::BASE_FONT_SIZE * 0.875),
+                                            ))
                                             .accessibility_label("关闭错误提示")
                                             .tooltip("关闭错误提示")
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -4528,7 +4545,7 @@ impl Render for Workbench {
                             .truncate()
                             .child(self.path.clone()),
                     )
-                    .right("v0.4.0"),
+                    .right(concat!("v", env!("CARGO_PKG_VERSION"))),
             )
     }
 }

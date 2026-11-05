@@ -4,13 +4,13 @@
 
 ReqSucc 是全中文、本地存储的原生桌面接口调试工具，支持 **HTTP、MQTT V5、WebSocket 和 Kafka**，可导入 Postman 集合与环境。使用 Rust、GPUI / GPUI Kit 构建，无需账号，工作数据保存在本机。
 
-当前版本：**0.4.0** · [下载与版本记录](https://github.com/twodogleee/ReqSucc/releases) · [构建状态](https://github.com/twodogleee/ReqSucc/actions) · [问题反馈](https://github.com/twodogleee/ReqSucc/issues) · [作者主页](https://36knight.com)
+当前版本：**0.4.1** · [下载与版本记录](https://github.com/twodogleee/ReqSucc/releases) · [构建状态](https://github.com/twodogleee/ReqSucc/actions) · [问题反馈](https://github.com/twodogleee/ReqSucc/issues) · [作者主页](https://36knight.com)
 
 ## 平台与下载
 
 | 平台 | 分发包 | 当前状态 |
 | --- | --- | --- |
-| macOS 15 及以上 / Apple Silicon | `ReqSucc-v<版本>-macos-arm64.zip` | 已完成本地构建与原生界面验收 |
+| macOS 13 及以上 / Apple Silicon | `ReqSucc-v<版本>-macos-arm64.zip` | macOS 13.0 实机已确认可用；13.1–14 待实机验收 |
 | Windows 10/11 / x64 | `ReqSucc-v<版本>-windows-x64.zip` | 已接入兼容代码和构建流程，首次远程构建与实机验收待完成 |
 | Intel Mac、Windows ARM64、Linux | — | 暂未提供构建与分发支持 |
 
@@ -116,17 +116,17 @@ rustup toolchain install 1.95.0 --profile minimal --component rustfmt
 
 ### macOS
 
-需要 Apple Silicon Mac、macOS 15 及以上和 Xcode Command Line Tools（`xcode-select --install`）。
+需要 Apple Silicon Mac 和 Xcode Command Line Tools（`xcode-select --install`）。应用最低部署目标为 macOS 13.0；已在 macOS 13.0 Apple Silicon 实机确认可用，当前构建环境为 macOS 15，macOS 13.1–14 尚待实机验收。
 
 ```sh
 # 使用隔离目录运行，避免影响日常数据
-REQSUCC_HOME=/tmp/reqsucc-development cargo run --locked
+MACOSX_DEPLOYMENT_TARGET=13.0 REQSUCC_HOME=/tmp/reqsucc-development cargo run --locked
 
 # 构建并打包调试版
 python3 scripts/package_macos.py
 
 # 构建正式版并生成分发 ZIP
-cargo build --release --locked
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release --locked
 python3 scripts/release.py package --platform macos-arm64
 ```
 
@@ -134,9 +134,9 @@ python3 scripts/release.py package --platform macos-arm64
 
 - 调试应用：`target/debug/ReqSucc.app`
 - 正式应用：`target/release/ReqSucc.app`
-- 分发包：`target/dist/ReqSucc-v0.4.0-macos-arm64.zip`
+- 分发包：`target/dist/ReqSucc-v0.4.1-macos-arm64.zip`
 
-只生成正式 `.app` 时可运行 `python3 scripts/package_macos.py --release`。已有最新二进制时可加 `--skip-build` 跳过编译；该选项不会检查源码是否比二进制更新。
+只生成正式 `.app` 时可运行 `python3 scripts/package_macos.py --release`，脚本会以 macOS 13.0 为最低部署目标构建。已有最新二进制时可加 `--skip-build` 跳过编译；该选项不会检查源码是否比二进制更新，打包前仍会校验二进制架构和最低部署版本。
 
 ### Windows
 
@@ -154,13 +154,13 @@ python scripts/release.py package --platform windows-x64 --binary-dir target/x86
 
 Windows 编译请使用上述开发者命令行或已加载 MSVC 环境的 PowerShell。若日志中的链接器为 `Git\usr\bin\link.exe`，说明误用了 Git Bash 的同名工具；应切换终端并检查 `where.exe link.exe` 的首项来自 Visual Studio。CI 使用 PowerShell 构建，显式固定 MSVC 链接器，并在依赖编译前验证宿主程序能完成链接和启动。
 
-输出为 `target/dist/ReqSucc-v0.4.0-windows-x64.zip`，包含 `ReqSucc.exe`、运行库、README 和许可文件。正式程序内嵌图标、版本与多显示器 DPI 清单，不显示控制台；启动失败和重复启动使用中文原生消息框。
+输出为 `target/dist/ReqSucc-v0.4.1-windows-x64.zip`，包含 `ReqSucc.exe`、运行库、README 和许可文件。正式程序内嵌图标、版本与多显示器 DPI 清单，不显示控制台；启动失败和重复启动使用中文原生消息框。
 
 Windows 执行清单由当前 `gpui-pre` 后端统一提供，包含普通用户权限与 `PerMonitorV2` DPI 配置。应用的 `assets/windows/app.rc` 仅嵌入图标和版本，不重复声明 `RT_MANIFEST`，避免链接时出现 `CVT1100: duplicate resource`。
 
 ## GitHub 构建与分发
 
-工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)。Windows 使用 `windows-2022`，macOS 使用 `macos-15` ARM64；两个平台独立运行测试与构建。
+工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)。Windows 使用 `windows-2022`，macOS 使用 `macos-15` ARM64 并以 13.0 为最低部署目标；两个平台独立运行测试与构建。macOS 15 的构建和测试不能代替其他系统版本的运行验收。
 
 | 触发方式 | 构建结果 | 是否发布 Release |
 | --- | --- | --- |
@@ -180,20 +180,20 @@ Artifacts 下载需要登录 GitHub 并有仓库读取权限，适合开发验�
 
 ### 正式发布
 
-确认工作区干净、待发布提交已经验收，并检查 `Cargo.toml`、`Cargo.lock` 与 README 版本一致。以下以当前 `0.4.0` 为例，最后一步会触发公开发布：
+确认工作区干净、待发布提交已经验收，并检查 `Cargo.toml`、`Cargo.lock` 与 README 版本一致。以下以当前 `0.4.1` 为例，最后一步会触发公开发布：
 
 ```sh
-python3 scripts/release.py metadata --tag v0.4.0
+python3 scripts/release.py metadata --tag v0.4.1
 git push origin main
-git tag -a v0.4.0 -m "ReqSucc 0.4.0"
-git push origin v0.4.0
+git tag -a v0.4.1 -m "ReqSucc 0.4.1"
+git push origin v0.4.1
 ```
 
 工作流自动生成版本说明，并向 [Releases](https://github.com/twodogleee/ReqSucc/releases) 上传：
 
 ```text
-ReqSucc-v0.4.0-windows-x64.zip
-ReqSucc-v0.4.0-macos-arm64.zip
+ReqSucc-v0.4.1-windows-x64.zip
+ReqSucc-v0.4.1-macos-arm64.zip
 SHA256SUMS.txt
 ```
 
@@ -225,7 +225,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 git diff --check
 ```
 
-macOS 当前回归结果为 88 项通过、1 项真实 Kafka 集群测试默认忽略；Windows 另有目录只读属性专用测试，结果以对应 Actions 运行记录为准。3 项 Python 测试覆盖标签版本、Windows 归档内容及双平台校验清单。
+macOS 最近一次回归结果为 89 项通过、1 项真实 Kafka 集群测试默认忽略；Windows 另有目录只读属性专用测试，结果以对应 Actions 运行记录为准。另有 4 项 macOS 字体兼容补丁测试，以及 6 项 Python 测试，覆盖标签版本、平台归档和校验清单等边界。
 
 Rust 自动化检查覆盖 HTTP、认证与变量、超时 / 取消、响应缓存、SQLite 恢复与迁移、草稿与保存版本分离，以及迁移前队列刷盘与失败阻断；MQTT 检查使用本机 TCP 模拟服务器，覆盖 V5 握手、QoS 0/1/2、拒绝回执、取消订阅、超时 / 取消、变量和所有 MQTT 页签的草稿保存，并检查发布用例、JSON 模板格式化、消息时间、标签重排、草稿复制、批量关闭、快捷键默认 / 清除 / 冲突规则及重启和迁移恢复；Postman 检查覆盖目录与认证映射、参数与变量、批量文件校验、同名追加、事务失败保护和重启恢复。另覆盖平台快捷键配置隔离、旧配置兼容、Windows 保留组合键及工作区窗口尺寸和缩放断点。它们是开发检查，不是产品中的脚本或断言功能。
 
@@ -281,6 +281,8 @@ python3 scripts/build_icons.py
 
 GPUI Kit 固定为 0.9.0，依赖版本由 Cargo.lock 锁定。`vendor/gpui-pre-macos` 基于上游 0.3.11，保留 Apache 许可证。该依赖有三处 `Option::map_or_default` 调用尚不能在本项目 stable 工具链上使用，替换为等价的 `map_or_else(Default::default, ...)`；通过 Cargo patch 引用，不要求 nightly 或 RUSTC_BOOTSTRAP。另有启动时显式加载应用包图标的本地补丁，用于处理开发应用重新打包后 Dock 沿用旧图标的问题。后续更新上游时分别核对这些补丁是否仍有必要。
 
+`vendor/core-text` 基于上游 21.0.0，保留 MIT 和 Apache 许可证。其本地补丁处理 macOS 13.0 将部分字体零值属性返回为布尔值的兼容问题，避免字体匹配误判；详见 [补丁说明](vendor/core-text/PATCHES.md)。
+
 ## 开源协议
 
 Copyright 2026 Andersen。项目采用 [Apache License 2.0](LICENSE)，归属声明见 [NOTICE](NOTICE)。
@@ -289,4 +291,4 @@ Copyright 2026 Andersen。项目采用 [Apache License 2.0](LICENSE)，归属声
 - 作者网站：[36knight.com](https://36knight.com)
 - 源码地址：[twodogleee/ReqSucc](https://github.com/twodogleee/ReqSucc)
 
-`vendor/` 中的第三方代码保留其原始许可证与署名，具体修改记录见 [gpui-pre-macos 补丁说明](vendor/gpui-pre-macos/PATCHES.md)。
+`vendor/` 中的第三方代码保留其原始许可证与署名，具体修改记录见 [gpui-pre-macos 补丁说明](vendor/gpui-pre-macos/PATCHES.md)和 [core-text 补丁说明](vendor/core-text/PATCHES.md)。

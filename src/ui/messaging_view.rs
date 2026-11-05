@@ -844,20 +844,14 @@ impl Workbench {
                         .flex_shrink_0()
                         .when(!error.is_empty(), |el| {
                             el.child(
-                                self.button(
+                                self.icon_button(
                                     "message-error-detail",
-                                    "",
+                                    &format!("查看消息错误：{error}"),
+                                    Icon::new(IconName::CircleAlert).text_color(cx.theme().danger),
                                     Action::MessageRecord(error_record),
                                     cx,
                                 )
-                                .icon(
-                                    Icon::new(IconName::CircleAlert)
-                                        .size(self.scaled(16.))
-                                        .text_color(cx.theme().danger),
-                                )
-                                .accessibility_label(format!("查看消息错误：{error}"))
-                                .tooltip(error.clone())
-                                .ghost(),
+                                .tooltip(error.clone()),
                             )
                         }),
                 )

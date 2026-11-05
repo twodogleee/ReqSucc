@@ -46,6 +46,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: 配置 macOS 最低部署版本
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"
       - name: 配置 MSVC x64 环境
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -107,6 +111,9 @@ jobs:
           cargo fmt --check
       - name: 测试
         run: cargo test --locked --target '${{ matrix.target }}'
+      - name: 测试 macOS 字体兼容补丁
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p core-text reqsucc_font_traits_tests --target '${{ matrix.target }}'
       - name: 构建开发版本
         if: github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
         run: cargo build --locked --target '${{ matrix.target }}'

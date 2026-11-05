@@ -1,6 +1,6 @@
 [package]
 name = "reqsucc"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "全中文本地 API 调试工作台"
 authors = ["Andersen <twodoglee@msn.com>"]
@@ -51,3 +51,4 @@ strip = true
 
 [patch.crates-io]
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+core-text = { path = "vendor/core-text" }

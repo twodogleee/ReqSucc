@@ -12,7 +12,7 @@ import pathlib
 import plistlib
 import shutil
 import subprocess
-from release import project_version
+from release import MACOS_MIN_VERSION, project_version, verify_binary
 
 # 打包开关分别控制构建模式、二进制复用和独立验收应用身份。
 parser=argparse.ArgumentParser()
@@ -30,7 +30,12 @@ profile='release' if args.release else 'debug'
 # 自定义输出目录用于 Actions 的显式目标构建，默认保留本地打包路径。
 binary_dir=args.binary_dir.resolve() if args.binary_dir else root/'target'/profile
 if not args.skip_build:
-    subprocess.run(['cargo','build','--locked']+(['--release'] if args.release else []),cwd=root,check=True)
+    # 构建和包元数据使用同一部署目标，包含 Cargo 调用的原生依赖构建。
+    build_env=os.environ.copy()
+    build_env['MACOSX_DEPLOYMENT_TARGET']=MACOS_MIN_VERSION
+    subprocess.run(['cargo','build','--locked']+(['--release'] if args.release else []),cwd=root,env=build_env,check=True)
+# 即使复用现有二进制，也须阻止架构或最低版本与包声明不一致。
+verify_binary(binary_dir/'reqsucc','macos-arm64')
 # 验收应用使用独立名称和包标识，避免与常规应用混淆。
 name='ReqSucc 验收' if args.preview else 'ReqSucc'
 # 应用包及其标准 Contents 目录，重复打包时更新同一目标。
@@ -53,7 +58,7 @@ if (contents/'Info.plist').exists():
         previous_info=plistlib.load(f)
 # 原生应用元数据；发布版本变更时应与 Cargo.toml 和 README 中的业务版本核对。
 version=project_version()
-info={'CFBundleName':name,'CFBundleDisplayName':name,'CFBundleIdentifier':'com.reqsucc.native-preview' if args.preview else 'com.reqsucc.desktop','CFBundleExecutable':'reqsucc','CFBundlePackageType':'APPL','CFBundleShortVersionString':version.split('-')[0],'CFBundleVersion':version.split('-')[0],'CFBundleIconFile':icon_name,'CFBundleDevelopmentRegion':'zh_CN','CFBundleLocalizations':['zh_CN'],'LSMinimumSystemVersion':'15.0','NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication','NSSupportsAutomaticGraphicsSwitching':True}
+info={'CFBundleName':name,'CFBundleDisplayName':name,'CFBundleIdentifier':'com.reqsucc.native-preview' if args.preview else 'com.reqsucc.desktop','CFBundleExecutable':'reqsucc','CFBundlePackageType':'APPL','CFBundleShortVersionString':version.split('-')[0],'CFBundleVersion':version.split('-')[0],'CFBundleIconFile':icon_name,'CFBundleDevelopmentRegion':'zh_CN','CFBundleLocalizations':['zh_CN'],'LSMinimumSystemVersion':MACOS_MIN_VERSION,'NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication','NSSupportsAutomaticGraphicsSwitching':True}
 if args.preview and previous_info.get('LSEnvironment'):
     info['LSEnvironment']=previous_info['LSEnvironment']
 with (contents/'Info.plist').open('wb') as f:plistlib.dump(info,f)

@@ -23,6 +23,47 @@ except ImportError:
 
 # 所有输入均相对仓库定位，发布产物统一放在被 Git 忽略的 target/dist。
 ROOT = Path(__file__).resolve().parent.parent
+# 所有 macOS 成品使用一致的最低系统版本；版本编码遵循 Mach-O 的 X.Y.Z 格式。
+MACOS_MIN_VERSION = '13.0'
+MACOS_MIN_VERSION_ENCODED = 13 << 16
+
+
+def verify_macos_binary(stream):
+    """校验 ARM64 可执行文件及其 Mach-O 最低系统版本，拒绝未知或不一致的输入。"""
+    header = stream.read(32)
+    if len(header) != 32:
+        raise ValueError('macOS 打包输入不是完整的 arm64 Mach-O 可执行文件')
+    magic, cpu, _, filetype, count, commands_size, _, _ = struct.unpack('<IiiIIIII', header)
+    if magic != 0xFEEDFACF or cpu != 0x0100000C or filetype != 2:
+        raise ValueError('macOS 打包输入必须是 arm64 Mach-O 可执行文件')
+    # 仅解析载入命令，限制读取长度并检查文件边界，避免损坏文件导致虚假通过。
+    stream.seek(0, os.SEEK_END)
+    if commands_size > 16 * 1024 * 1024 or commands_size > stream.tell() - 32:
+        raise ValueError('macOS 可执行文件的载入命令不完整')
+    stream.seek(32)
+    commands = stream.read(commands_size)
+    offset = 0
+    versions = []
+    for _ in range(count):
+        if offset + 8 > len(commands):
+            raise ValueError('macOS 可执行文件的载入命令不完整')
+        command, length = struct.unpack_from('<II', commands, offset)
+        if length < 8 or length % 8 or offset + length > len(commands):
+            raise ValueError('macOS 可执行文件的载入命令无效')
+        if command == 0x32:  # LC_BUILD_VERSION：platform 1 表示 macOS。
+            if length < 24:
+                raise ValueError('macOS 可执行文件的版本信息不完整')
+            platform, minimum = struct.unpack_from('<II', commands, offset + 8)
+            if platform != 1:
+                raise ValueError('macOS 可执行文件的平台版本信息不匹配')
+            versions.append(minimum)
+        elif command == 0x24:  # 旧版 LC_VERSION_MIN_MACOSX。
+            if length < 16:
+                raise ValueError('macOS 可执行文件的版本信息不完整')
+            versions.append(struct.unpack_from('<I', commands, offset + 8)[0])
+        offset += length
+    if offset != len(commands) or versions != [MACOS_MIN_VERSION_ENCODED]:
+        raise ValueError(f'macOS 可执行文件的最低部署版本必须为 {MACOS_MIN_VERSION}；请重新构建')
 
 
 def project_version():
@@ -44,18 +85,20 @@ def check_tag(version, tag):
 
 
 def verify_binary(binary, platform):
-    """校验可执行文件头的架构，防止把主机构建误标为另一个平台。"""
+    """校验可执行文件架构及 macOS 部署版本，防止发布错误的平台成品。"""
     with binary.open('rb') as stream:
-        header = stream.read(64)
         if platform == 'windows-x64':
+            header = stream.read(64)
             if len(header) != 64 or header[:2] != b'MZ':
                 raise ValueError('Windows 打包输入不是 PE 可执行文件')
             stream.seek(struct.unpack_from('<I', header, 60)[0])
             pe = stream.read(6)
             if pe != b'PE\0\0\x64\x86':
                 raise ValueError('Windows 打包输入必须是 x64 可执行文件')
-        elif header[:8] != b'\xcf\xfa\xed\xfe\x0c\x00\x00\x01':
-            raise ValueError('macOS 打包输入必须是 arm64 Mach-O 可执行文件')
+        elif platform == 'macos-arm64':
+            verify_macos_binary(stream)
+        else:
+            raise ValueError(f'不支持的打包平台：{platform}')
 
 
 def windows_runtime():
@@ -86,13 +129,26 @@ def package(platform, version, binary_dir, output_dir):
         staging.mkdir()
         for document in ['LICENSE', 'NOTICE', 'README.md']:
             shutil.copy2(ROOT / document, staging / document)
+        # NOTICE 与 README 引用的第三方许可和补丁说明必须随分发包提供。
+        for document in [
+            'vendor/gpui-pre-macos/LICENSE-APACHE',
+            'vendor/gpui-pre-macos/PATCHES.md',
+            'vendor/core-text/COPYRIGHT',
+            'vendor/core-text/LICENSE-APACHE',
+            'vendor/core-text/LICENSE-MIT',
+            'vendor/core-text/PATCHES.md',
+        ]:
+            destination = staging / document
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / document, destination)
         if platform == 'windows-x64':
             shutil.copy2(binary, staging / 'ReqSucc.exe')
             for library in windows_runtime().glob('*.dll'):
                 shutil.copy2(library, staging / library.name)
             with zipfile.ZipFile(archive.with_suffix('.tmp'), 'w', zipfile.ZIP_DEFLATED) as bundle:
-                for path in sorted(staging.iterdir()):
-                    bundle.write(path, f'{name}/{path.name}')
+                for path in sorted(staging.rglob('*')):
+                    if path.is_file():
+                        bundle.write(path, f'{name}/{path.relative_to(staging).as_posix()}')
         else:
             subprocess.run([
                 sys.executable, str(ROOT / 'scripts/package_macos.py'),
