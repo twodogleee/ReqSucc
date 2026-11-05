@@ -85,7 +85,9 @@ class ReleaseTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, str(release.ROOT / 'scripts/package_macos.py'),
                  '--skip-build', '--binary-dir', str(directory)],
-                capture_output=True, text=True,
+                # Windows 默认标准错误编码可能无法表示中文，显式统一子进程编码。
+                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+                capture_output=True, text=True, encoding='utf-8',
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('最低部署版本必须为 13.0', result.stderr)
