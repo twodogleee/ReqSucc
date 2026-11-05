@@ -489,7 +489,10 @@ impl Workspace {
                     .map_err(io)?;
             }
             drop(backup);
-            File::open(backup_dir.join(DB))
+            // Windows 刷盘需要可写句柄；只打开既有备份，不创建或截断数据库。
+            OpenOptions::new()
+                .write(true)
+                .open(backup_dir.join(DB))
                 .and_then(|f| f.sync_all())
                 .map_err(io)?;
             atomic_json(&backup_dir.join("manifest.json"), &w.manifest)?;
@@ -778,7 +781,10 @@ impl StorageService {
                 dest.conn
                     .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                     .map_err(io)?;
-                File::open(dest.path.join(DB))
+                // Windows 不允许通过只读句柄刷盘；保留现有数据库内容并传播同步失败。
+                OpenOptions::new()
+                    .write(true)
+                    .open(dest.path.join(DB))
                     .and_then(|f| f.sync_all())
                     .map_err(io)?;
                 dest
