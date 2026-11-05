@@ -3,7 +3,6 @@
 #include <windows.h>
 
 1 ICON "assets/ReqSucc.ico"
-1 RT_MANIFEST "assets/windows/app.manifest"
 
 1 VERSIONINFO
 FILEVERSION APP_VERSION_NUM

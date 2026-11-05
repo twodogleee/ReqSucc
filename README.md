@@ -156,6 +156,8 @@ Windows 编译请使用上述开发者命令行或已加载 MSVC 环境的 Power
 
 输出为 `target/dist/ReqSucc-v0.4.0-windows-x64.zip`，包含 `ReqSucc.exe`、运行库、README 和许可文件。正式程序内嵌图标、版本与多显示器 DPI 清单，不显示控制台；启动失败和重复启动使用中文原生消息框。
 
+Windows 执行清单由当前 `gpui-pre` 后端统一提供，包含普通用户权限与 `PerMonitorV2` DPI 配置。应用的 `assets/windows/app.rc` 仅嵌入图标和版本，不重复声明 `RT_MANIFEST`，避免链接时出现 `CVT1100: duplicate resource`。
+
 ## GitHub 构建与分发
 
 工作流：[`.github/workflows/build.yml`](.github/workflows/build.yml)。Windows 使用 `windows-2022`，macOS 使用 `macos-15` ARM64；两个平台独立运行测试与构建。
@@ -251,7 +253,7 @@ python3 scripts/test_kafka.py
 - `src/http.rs`：Rust HTTP 执行、取消、认证、变量与响应缓存。
 - `src/storage.rs`、`migrations/`：SQLite、目录迁移和数据兼容。
 - `src/postman.rs`、`src/ui/postman_view.rs`：Postman 解析、导入预览与事务保存。
-- `build.rs`、`assets/windows/`：Windows 图标、版本和 DPI 资源。
+- `build.rs`、`assets/windows/`：Windows 应用图标与版本资源；DPI 清单由 GPUI 提供。
 - `scripts/package_macos.py`、`scripts/release.py`：应用打包、版本校验与分发清单。
 - `.github/workflows/build.yml`：双平台构建、验收产物与标签发布。
 
